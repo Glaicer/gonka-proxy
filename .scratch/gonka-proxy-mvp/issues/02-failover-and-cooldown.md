@@ -32,4 +32,4 @@ None - Issue 01 was resolved in commit `7e6cf76`.
 
 ### 2026-08-19
 
-Resolved with shared concurrency-safe Provider Cooldowns, failover for `429`, `5xx`, network failures, and response-header timeouts, transparent Client Error forwarding, and black-box coverage. `go test ./...`, `go vet ./...`, and race-detected issue tests pass.
+Resolved in commit `de60156` with shared concurrency-safe Provider Cooldowns, failover for `429`, `5xx`, network failures, and response-header timeouts, transparent Client Error forwarding, and black-box coverage. `go test ./...`, `go vet ./...`, and race-detected issue tests pass.
