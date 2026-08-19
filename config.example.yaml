@@ -1,0 +1,17 @@
+server:
+  listen_address: 0.0.0.0:8080
+
+# These values default to 120s, 30s, and 60s when omitted.
+cooldown: 120s
+recovery_wait: 30s
+response_header_timeout: 60s
+
+providers:
+  - base_url: https://provider.example/v1
+    api_key: replace-with-provider-key
+    model_alias: provider-model-name
+    priority: 100
+  - base_url: https://backup.example/v1
+    api_key: replace-with-provider-key
+    model_alias: backup-model-name
+    priority: 50
