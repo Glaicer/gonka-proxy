@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,13 +24,16 @@ type Server struct {
 	providers        []*provider
 	client           *http.Client
 	cooldownDuration time.Duration
+	recoveryWait     time.Duration
 	cooldownMu       sync.Mutex
+	cooldownVersion  uint64
 }
 
 type provider struct {
 	config.Provider
-	chatURL       string
-	cooldownUntil time.Time
+	chatURL          string
+	cooldownUntil    time.Time
+	cooldownVersion  uint64
 }
 
 // New creates a proxy handler from validated configuration.
@@ -63,6 +67,7 @@ func New(cfg config.Config) (*Server, error) {
 	return &Server{
 		providers:        providers,
 		cooldownDuration: cfg.Cooldown,
+		recoveryWait:     cfg.RecoveryWait,
 		client: &http.Client{
 			Transport: transport,
 		},
@@ -105,61 +110,116 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
-	for _, selected := range s.providers {
-		if !s.providerAvailable(selected, time.Now()) {
-			continue
-		}
-
-		upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
-		if err != nil {
-			http.Error(w, "could not encode upstream request", http.StatusBadGateway)
+	for {
+		if r.Context().Err() != nil {
 			return
 		}
 
-		upstreamRequest, err := http.NewRequestWithContext(
-			r.Context(),
-			http.MethodPost,
-			selected.chatURL,
-			bytes.NewReader(upstreamBody),
-		)
-		if err != nil {
-			http.Error(w, "could not create upstream request", http.StatusBadGateway)
-			return
-		}
-		copyHeaders(upstreamRequest.Header, r.Header)
-		upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
-
-		upstreamResponse, err := s.client.Do(upstreamRequest)
-		if err != nil {
+		for _, selected := range s.providers {
 			if r.Context().Err() != nil {
 				return
 			}
-			s.markCooldown(selected)
-			continue
-		}
 
-		if isFailoverStatus(upstreamResponse.StatusCode) {
-			_ = upstreamResponse.Body.Close()
-			s.markCooldown(selected)
-			continue
-		}
+			if !s.providerAvailable(selected, time.Now()) {
+				continue
+			}
 
-		streaming := isStreamingResponse(upstreamResponse, payload)
-		defer upstreamResponse.Body.Close()
-		copyHeaders(w.Header(), upstreamResponse.Header)
-		w.WriteHeader(upstreamResponse.StatusCode)
-		if streaming {
-			s.forwardStreamingResponse(w, r, selected, upstreamResponse.Body)
+			upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
+			if err != nil {
+				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
+				return
+			}
+
+			upstreamRequest, err := http.NewRequestWithContext(
+				r.Context(),
+				http.MethodPost,
+				selected.chatURL,
+				bytes.NewReader(upstreamBody),
+			)
+			if err != nil {
+				http.Error(w, "could not create upstream request", http.StatusBadGateway)
+				return
+			}
+			copyHeaders(upstreamRequest.Header, r.Header)
+			upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
+
+			upstreamResponse, err := s.client.Do(upstreamRequest)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
+				s.markCooldown(selected)
+				continue
+			}
+
+			if isFailoverStatus(upstreamResponse.StatusCode) {
+				_ = upstreamResponse.Body.Close()
+				s.markCooldown(selected)
+				continue
+			}
+
+			streaming := isStreamingResponse(upstreamResponse, payload)
+			defer upstreamResponse.Body.Close()
+			copyHeaders(w.Header(), upstreamResponse.Header)
+			w.WriteHeader(upstreamResponse.StatusCode)
+			if streaming {
+				s.forwardStreamingResponse(w, r, selected, upstreamResponse.Body)
+				return
+			}
+			_, _ = io.Copy(w, upstreamResponse.Body)
 			return
 		}
-		_, _ = io.Copy(w, upstreamResponse.Body)
-		return
-	}
 
-	if r.Context().Err() != nil {
-		return
+		if !s.waitForRecovery(r.Context()) {
+			return
+		}
 	}
-	http.Error(w, "all Providers failed", http.StatusBadGateway)
+}
+
+func (s *Server) waitForRecovery(ctx context.Context) bool {
+	cooldownVersions := s.snapshotCooldownVersions()
+	timer := time.NewTimer(s.recoveryWait)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		if ctx.Err() != nil {
+			return false
+		}
+		s.clearCooldowns(cooldownVersions)
+		return true
+	}
+}
+
+func (s *Server) snapshotCooldownVersions() map[*provider]uint64 {
+	s.cooldownMu.Lock()
+	defer s.cooldownMu.Unlock()
+
+	versions := make(map[*provider]uint64, len(s.providers))
+	for _, selected := range s.providers {
+		versions[selected] = selected.cooldownVersion
+	}
+	return versions
+}
+
+func (s *Server) clearCooldowns(versions map[*provider]uint64) {
+	s.cooldownMu.Lock()
+	defer s.cooldownMu.Unlock()
+	for _, selected := range s.providers {
+		if selected.cooldownVersion != versions[selected] {
+			continue
+		}
+		selected.cooldownUntil = time.Time{}
+	}
 }
 
 func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, body io.Reader) {
@@ -221,6 +281,8 @@ func (s *Server) providerAvailable(selected *provider, now time.Time) bool {
 func (s *Server) markCooldown(selected *provider) {
 	cooldownUntil := time.Now().Add(s.cooldownDuration)
 	s.cooldownMu.Lock()
+	s.cooldownVersion = s.cooldownVersion + 1
+	selected.cooldownVersion = s.cooldownVersion
 	if cooldownUntil.After(selected.cooldownUntil) {
 		selected.cooldownUntil = cooldownUntil
 	}

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glaicer/gonka-proxy/internal/config"
 )
@@ -28,6 +29,20 @@ func TestLoadAppliesDocumentedDefaults(t *testing.T) {
 	}
 	if cfg.ResponseHeaderTimeout != config.DefaultResponseHeaderTimeout {
 		t.Errorf("ResponseHeaderTimeout = %s, want %s", cfg.ResponseHeaderTimeout, config.DefaultResponseHeaderTimeout)
+	}
+}
+
+func TestLoadParsesRecoveryWait(t *testing.T) {
+	cfg := loadConfig(t, `recovery_wait: 25ms
+providers:
+  - base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`)
+
+	if cfg.RecoveryWait != 25*time.Millisecond {
+		t.Errorf("RecoveryWait = %s, want 25ms", cfg.RecoveryWait)
 	}
 }
 

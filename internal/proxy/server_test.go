@@ -554,6 +554,226 @@ func TestChatCompletionsSharesCooldownAcrossConcurrentRequests(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsWaitsForRecoveryBeforeNewRoutingPass(t *testing.T) {
+	const recoveryWait = 40 * time.Millisecond
+	var providerHits atomic.Int32
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if providerHits.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"recovered"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServerWithRecoveryTiming(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	}, time.Second, recoveryWait, time.Second)
+	defer server.Close()
+
+	startedAt := time.Now()
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if elapsed := time.Since(startedAt); elapsed < recoveryWait*3/4 {
+		t.Fatalf("request completed after %s, want Recovery Wait of about %s", elapsed, recoveryWait)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != `{"provider":"recovered"}` {
+		t.Fatalf("response body = %s, want recovered Provider response", body)
+	}
+	if got := providerHits.Load(); got != 2 {
+		t.Fatalf("Provider received %d requests, want one attempt on each Routing Pass", got)
+	}
+}
+
+func TestChatCompletionsStartsNewRoutingPassInPriorityOrder(t *testing.T) {
+	const recoveryWait = 30 * time.Millisecond
+	attempts := make(chan string, 4)
+	var highHits atomic.Int32
+	var lowHits atomic.Int32
+
+	highProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := highHits.Add(1)
+		attempts <- fmt.Sprintf("high-%d", attempt)
+		if attempt < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"high"}`)
+	}))
+	defer highProvider.Close()
+
+	lowProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := lowHits.Add(1)
+		attempts <- fmt.Sprintf("low-%d", attempt)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"low"}`)
+	}))
+	defer lowProvider.Close()
+
+	server := newProxyServerWithRecoveryTiming(t, []providerFixture{
+		{baseURL: lowProvider.URL + "/v1", apiKey: "low-secret", modelAlias: "low-model", priority: 10},
+		{baseURL: highProvider.URL + "/v1", apiKey: "high-secret", modelAlias: "high-model", priority: 100},
+	}, time.Second, recoveryWait, time.Second)
+	defer server.Close()
+
+	startedAt := time.Now()
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if elapsed := time.Since(startedAt); elapsed < recoveryWait*3/4 {
+		t.Fatalf("request completed after %s, want Recovery Wait before the second Routing Pass", elapsed)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != `{"provider":"low"}` {
+		t.Fatalf("response body = %s, want low Provider response", body)
+	}
+
+	var gotAttempts []string
+	for range 4 {
+		select {
+		case attempt := <-attempts:
+			gotAttempts = append(gotAttempts, attempt)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for Provider attempts")
+		}
+	}
+	if want := []string{"high-1", "low-1", "high-2", "low-2"}; !reflect.DeepEqual(gotAttempts, want) {
+		t.Fatalf("Provider attempts = %v, want %v", gotAttempts, want)
+	}
+}
+
+func TestChatCompletionsRepeatsRecoveryWaitAndRoutingPassUntilProviderSucceeds(t *testing.T) {
+	const (
+		failuresBeforeSuccess = 5
+		recoveryWait          = 10 * time.Millisecond
+	)
+	var providerHits atomic.Int32
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if providerHits.Add(1) <= failuresBeforeSuccess {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"eventually-recovered"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServerWithRecoveryTiming(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	}, time.Second, recoveryWait, time.Second)
+	defer server.Close()
+
+	startedAt := time.Now()
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if elapsed := time.Since(startedAt); elapsed < recoveryWait*time.Duration(failuresBeforeSuccess)*3/4 {
+		t.Fatalf("request completed after %s, want multiple Recovery Waits", elapsed)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != `{"provider":"eventually-recovered"}` {
+		t.Fatalf("response body = %s, want eventual recovery response", body)
+	}
+	if got := providerHits.Load(); got != failuresBeforeSuccess+1 {
+		t.Fatalf("Provider received %d requests, want %d", got, failuresBeforeSuccess+1)
+	}
+}
+
+func TestChatCompletionsCancelsRecoveryWait(t *testing.T) {
+	const recoveryWait = 200 * time.Millisecond
+	var providerHits atomic.Int32
+	firstFailure := make(chan struct{})
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if providerHits.Add(1) == 1 {
+			close(firstFailure)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		t.Error("Provider received a request after the downstream request was canceled")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+
+	server := newProxyServerWithRecoveryTiming(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	}, time.Second, recoveryWait, time.Second)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		resp, requestErr := http.DefaultClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		result <- requestErr
+	}()
+
+	select {
+	case <-firstFailure:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("timed out waiting for the first failed Provider attempt")
+	}
+	cancel()
+
+	select {
+	case requestErr := <-result:
+		if requestErr == nil {
+			t.Error("proxy request completed successfully after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy request did not finish after Recovery Wait cancellation")
+	}
+
+	time.Sleep(recoveryWait / 2)
+	if got := providerHits.Load(); got != 1 {
+		t.Fatalf("Provider received %d requests after cancellation, want 1", got)
+	}
+}
+
 func TestChatCompletionsReturnsClientErrorsWithoutFailoverOrCooldown(t *testing.T) {
 	for _, testCase := range []struct {
 		statusCode int
@@ -1080,12 +1300,25 @@ func newProxyServerWithTiming(t *testing.T, providers []providerFixture, cooldow
 	return newProxyServerWithTimingValues(t, providers, cooldown.String(), responseHeaderTimeout.String())
 }
 
+func newProxyServerWithRecoveryTiming(t *testing.T, providers []providerFixture, cooldown, recoveryWait, responseHeaderTimeout time.Duration) *httptest.Server {
+	t.Helper()
+	return newProxyServerWithTimingValuesAndRecovery(t, providers, cooldown.String(), recoveryWait.String(), responseHeaderTimeout.String())
+}
+
 func newProxyServerWithTimingValues(t *testing.T, providers []providerFixture, cooldown, responseHeaderTimeout string) *httptest.Server {
+	t.Helper()
+	return newProxyServerWithTimingValuesAndRecovery(t, providers, cooldown, "", responseHeaderTimeout)
+}
+
+func newProxyServerWithTimingValuesAndRecovery(t *testing.T, providers []providerFixture, cooldown, recoveryWait, responseHeaderTimeout string) *httptest.Server {
 	t.Helper()
 
 	var yaml strings.Builder
 	if cooldown != "" {
 		fmt.Fprintf(&yaml, "cooldown: %s\n", cooldown)
+	}
+	if recoveryWait != "" {
+		fmt.Fprintf(&yaml, "recovery_wait: %s\n", recoveryWait)
 	}
 	if responseHeaderTimeout != "" {
 		fmt.Fprintf(&yaml, "response_header_timeout: %s\n", responseHeaderTimeout)
