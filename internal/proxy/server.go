@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -143,9 +144,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			continue
 		}
 
+		streaming := isStreamingResponse(upstreamResponse, payload)
 		defer upstreamResponse.Body.Close()
 		copyHeaders(w.Header(), upstreamResponse.Header)
 		w.WriteHeader(upstreamResponse.StatusCode)
+		if streaming {
+			s.forwardStreamingResponse(w, r, selected, upstreamResponse.Body)
+			return
+		}
 		_, _ = io.Copy(w, upstreamResponse.Body)
 		return
 	}
@@ -154,6 +160,56 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 		return
 	}
 	http.Error(w, "all Providers failed", http.StatusBadGateway)
+}
+
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, body io.Reader) {
+	flusher, canFlush := w.(http.Flusher)
+	if canFlush {
+		flusher.Flush()
+	}
+
+	buffer := make([]byte, 32*1024)
+	for {
+		readCount, readErr := body.Read(buffer)
+		if readCount > 0 {
+			chunk := buffer[:readCount]
+			if _, writeErr := w.Write(chunk); writeErr != nil {
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+		if r.Context().Err() == nil {
+			s.markCooldown(selected)
+		}
+		return
+	}
+}
+
+func isStreamingResponse(response *http.Response, payload map[string]json.RawMessage) bool {
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return false
+	}
+
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	if strings.HasPrefix(contentType, "text/event-stream") {
+		return true
+	}
+
+	streamValue, ok := payload["stream"]
+	if !ok {
+		return false
+	}
+	var requested bool
+	return json.Unmarshal(streamValue, &requested) == nil && requested
 }
 
 func (s *Server) providerAvailable(selected *provider, now time.Time) bool {

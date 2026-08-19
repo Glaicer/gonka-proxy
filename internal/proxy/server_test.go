@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -591,7 +592,7 @@ func TestChatCompletionsReturnsClientErrorsWithoutFailoverOrCooldown(t *testing.
 			defer server.Close()
 
 			for requestNumber := 0; requestNumber < 2; requestNumber++ {
-				req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+				req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -734,6 +735,325 @@ func TestChatCompletionsPropagatesDownstreamCancellation(t *testing.T) {
 	case <-canceled:
 	case <-time.After(time.Second):
 		t.Fatal("upstream request did not observe downstream cancellation")
+	}
+}
+
+func TestChatCompletionsStreamsProviderResponsesIncrementally(t *testing.T) {
+	firstChunkWritten := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseProvider)
+		})
+	}
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Provider-Trace", "stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"delta\":\"first\"}\n\n")
+		flusher.Flush()
+		close(firstChunkWritten)
+		<-releaseProvider
+		_, _ = io.WriteString(w, "data: {\"delta\":\"second\"}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer func() {
+		release()
+		provider.Close()
+	}()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	proxyResponse := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		proxyResponse <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("timed out waiting for streaming Provider to write its first chunk")
+	}
+
+	var response *http.Response
+	select {
+	case result := <-proxyResponse:
+		if result.err != nil {
+			t.Fatalf("proxy request: %v", result.err)
+		}
+		response = result.response
+	case <-time.After(time.Second):
+		release()
+		result := <-proxyResponse
+		if result.response != nil {
+			_ = result.response.Body.Close()
+		}
+		t.Fatalf("proxy did not expose streaming response headers promptly (request error: %v)", result.err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache", got)
+	}
+	if got := response.Header.Get("X-Provider-Trace"); got != "stream" {
+		t.Fatalf("X-Provider-Trace = %q, want stream", got)
+	}
+
+	firstRead := make(chan struct {
+		body []byte
+		err  error
+	}, 1)
+	go func() {
+		buffer := make([]byte, 128)
+		count, readErr := response.Body.Read(buffer)
+		firstRead <- struct {
+			body []byte
+			err  error
+		}{body: buffer[:count], err: readErr}
+	}()
+
+	var firstChunk []byte
+	select {
+	case result := <-firstRead:
+		if result.err != nil && result.err != io.EOF {
+			t.Fatalf("read first stream chunk: %v", result.err)
+		}
+		firstChunk = append([]byte(nil), result.body...)
+	case <-time.After(time.Second):
+		release()
+		<-firstRead
+		t.Fatal("proxy buffered the first Provider stream chunk")
+	}
+
+	const expectedFirstChunk = "data: {\"delta\":\"first\"}\n\n"
+	if string(firstChunk) != expectedFirstChunk {
+		t.Fatalf("first stream chunk = %q, want %q", firstChunk, expectedFirstChunk)
+	}
+
+	release()
+	rest, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read remaining stream: %v", err)
+	}
+	gotBody := append(firstChunk, rest...)
+	wantBody := expectedFirstChunk + "data: {\"delta\":\"second\"}\n\ndata: [DONE]\n\n"
+	if string(gotBody) != wantBody {
+		t.Fatalf("stream body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+func TestChatCompletionsMarksInterruptedStreamCooldownWithoutFailover(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+	const interruptedChunk = "data: {\"provider\":\"primary\"}\n\n"
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "100")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, interruptedChunk)
+		flusher.Flush()
+		// The declared length exceeds the bytes sent to simulate an interrupted generation.
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, 200*time.Millisecond, time.Second)
+	defer server.Close()
+
+	firstResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+	)
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	firstBody, err := io.ReadAll(firstResponse.Body)
+	_ = firstResponse.Body.Close()
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("read interrupted stream: %v", err)
+	}
+	if firstResponse.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", firstResponse.StatusCode, http.StatusOK)
+	}
+	if string(firstBody) != interruptedChunk {
+		t.Fatalf("first body = %q, want %q", firstBody, interruptedChunk)
+	}
+	if got := backupHits.Load(); got != 0 {
+		t.Fatalf("backup Provider received %d requests during interrupted stream, want 0", got)
+	}
+
+	secondResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatalf("second proxy request: %v", err)
+	}
+	defer secondResponse.Body.Close()
+	secondBody, err := io.ReadAll(secondResponse.Body)
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if secondResponse.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", secondResponse.StatusCode, http.StatusOK)
+	}
+	if string(secondBody) != `{"provider":"backup"}` {
+		t.Fatalf("second body = %s, want backup response", secondBody)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1 while cooldown is active", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsCancelsStreamingProviderOnClientCancellation(t *testing.T) {
+	streamStarted := make(chan struct{})
+	streamCanceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"delta\":\"active\"}\n\n")
+		flusher.Flush()
+		startedOnce.Do(func() {
+			close(streamStarted)
+		})
+		<-r.Context().Done()
+		canceledOnce.Do(func() {
+			close(streamCanceled)
+		})
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	proxyResponse := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		proxyResponse <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for streaming Provider request")
+	}
+
+	var response *http.Response
+	select {
+	case result := <-proxyResponse:
+		if result.err != nil {
+			t.Fatalf("proxy request: %v", result.err)
+		}
+		response = result.response
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not expose streaming response headers")
+	}
+	defer response.Body.Close()
+
+	firstChunkRead := make(chan struct {
+		count int
+		err   error
+	}, 1)
+	go func() {
+		buffer := make([]byte, 128)
+		count, readErr := response.Body.Read(buffer)
+		firstChunkRead <- struct {
+			count int
+			err   error
+		}{count: count, err: readErr}
+	}()
+	select {
+	case result := <-firstChunkRead:
+		if result.count == 0 {
+			t.Fatalf("first stream read returned no data (error: %v)", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first streamed chunk")
+	}
+
+	cancel()
+	select {
+	case <-streamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not close the active upstream stream")
 	}
 }
 
