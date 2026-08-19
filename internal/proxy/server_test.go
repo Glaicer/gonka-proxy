@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,6 +150,488 @@ func TestChatCompletionsPreservesDeclarationOrderForEqualPriority(t *testing.T) 
 	}
 }
 
+func TestChatCompletionsFailsOverOnRateLimit(t *testing.T) {
+	var rateLimitedHits atomic.Int32
+	var backupHits atomic.Int32
+
+	rateLimitedProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rateLimitedHits.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer rateLimitedProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: rateLimitedProvider.URL + "/v1", apiKey: "rate-limited-secret", modelAlias: "rate-limited-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(responseBody) != `{"provider":"backup"}` {
+		t.Fatalf("response body = %s, want backup response", responseBody)
+	}
+	if got := rateLimitedHits.Load(); got != 1 {
+		t.Fatalf("rate-limited Provider received %d requests, want 1", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsFailsOverOnServerErrors(t *testing.T) {
+	for _, statusCode := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			var failedHits atomic.Int32
+			var backupHits atomic.Int32
+
+			failedProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				failedHits.Add(1)
+				w.WriteHeader(statusCode)
+			}))
+			defer failedProvider.Close()
+
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"provider":"backup"}`)
+			}))
+			defer backupProvider.Close()
+
+			server := newProxyServer(t, []providerFixture{
+				{baseURL: failedProvider.URL + "/v1", apiKey: "failed-secret", modelAlias: "failed-model", priority: 100},
+				{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+			})
+			defer server.Close()
+
+			resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			if got, err := io.ReadAll(resp.Body); err != nil {
+				t.Fatalf("read response body: %v", err)
+			} else if string(got) != `{"provider":"backup"}` {
+				t.Fatalf("response body = %s, want backup response", got)
+			}
+			if got := failedHits.Load(); got != 1 {
+				t.Fatalf("failed Provider received %d requests, want 1", got)
+			}
+			if got := backupHits.Load(); got != 1 {
+				t.Fatalf("backup Provider received %d requests, want 1", got)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsFailsOverOnNetworkFailure(t *testing.T) {
+	var failedProviderHits atomic.Int32
+	var backupProviderHits atomic.Int32
+
+	failedProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failedProviderHits.Add(1)
+	}))
+	failedProviderURL := failedProvider.URL
+	failedProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupProviderHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: failedProviderURL + "/v1", apiKey: "failed-secret", modelAlias: "failed-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	} else if string(got) != `{"provider":"backup"}` {
+		t.Fatalf("response body = %s, want backup response", got)
+	}
+	if got := failedProviderHits.Load(); got != 0 {
+		t.Fatalf("closed Provider received %d requests, want 0", got)
+	}
+	if got := backupProviderHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsFailsOverOnResponseHeaderTimeout(t *testing.T) {
+	var slowProviderHits atomic.Int32
+	var backupProviderHits atomic.Int32
+	releaseSlowProvider := make(chan struct{})
+
+	slowProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowProviderHits.Add(1)
+		select {
+		case <-releaseSlowProvider:
+		case <-r.Context().Done():
+		}
+	}))
+	defer func() {
+		close(releaseSlowProvider)
+		slowProvider.Close()
+	}()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupProviderHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: slowProvider.URL + "/v1", apiKey: "slow-secret", modelAlias: "slow-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, 2*time.Second, 20*time.Millisecond)
+	defer server.Close()
+
+	startedAt := time.Now()
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		t.Fatalf("request took %s, want response-header timeout failover", elapsed)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	} else if string(got) != `{"provider":"backup"}` {
+		t.Fatalf("response body = %s, want backup response", got)
+	}
+	if got := slowProviderHits.Load(); got != 1 {
+		t.Fatalf("slow Provider received %d requests, want 1", got)
+	}
+	if got := backupProviderHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsFailsOverInPriorityOrderWithoutRepeatingAProvider(t *testing.T) {
+	attempts := make(chan string, 3)
+
+	lowProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts <- "low"
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"low"}`)
+	}))
+	defer lowProvider.Close()
+
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts <- "first"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer firstProvider.Close()
+
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts <- "second"
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer secondProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: lowProvider.URL + "/v1", apiKey: "low-secret", modelAlias: "low-model", priority: 10},
+		{baseURL: firstProvider.URL + "/v1", apiKey: "first-secret", modelAlias: "first-model", priority: 100},
+		{baseURL: secondProvider.URL + "/v1", apiKey: "second-secret", modelAlias: "second-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(responseBody) != `{"provider":"low"}` {
+		t.Fatalf("response body = %s, want low Provider response", responseBody)
+	}
+
+	var gotAttempts []string
+	for range 3 {
+		select {
+		case attempt := <-attempts:
+			gotAttempts = append(gotAttempts, attempt)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for Provider attempts")
+		}
+	}
+	if want := []string{"first", "second", "low"}; !reflect.DeepEqual(gotAttempts, want) {
+		t.Fatalf("Provider attempts = %v, want %v", gotAttempts, want)
+	}
+}
+
+func TestChatCompletionsSkipsProviderDuringCooldownAndUsesItAfterExpiry(t *testing.T) {
+	const cooldown = 40 * time.Millisecond
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if primaryHits.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"primary"}`)
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, cooldown, time.Second)
+	defer server.Close()
+
+	post := func() (int, string) {
+		t.Helper()
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	if status, body := post(); status != http.StatusOK || body != `{"provider":"backup"}` {
+		t.Fatalf("first response = (%d, %s), want backup success", status, body)
+	}
+	if status, body := post(); status != http.StatusOK || body != `{"provider":"backup"}` {
+		t.Fatalf("cooldown response = (%d, %s), want backup success", status, body)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests during active cooldown, want 1", got)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for primaryHits.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("primary Provider did not become available after cooldown expiry")
+		}
+		status, body := post()
+		if status != http.StatusOK || body != `{"provider":"primary"}` {
+			if time.Sleep(5 * time.Millisecond); time.Now().Before(deadline) {
+				continue
+			}
+			t.Fatalf("post-expiry response = (%d, %s), want primary success", status, body)
+		}
+	}
+	if got := primaryHits.Load(); got != 2 {
+		t.Fatalf("primary Provider received %d requests after expiry, want exactly 2", got)
+	}
+	if got := backupHits.Load(); got < 2 {
+		t.Fatalf("backup Provider received %d requests, want at least 2", got)
+	}
+}
+
+func TestChatCompletionsSharesCooldownAcrossConcurrentRequests(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, time.Second, time.Second)
+	defer server.Close()
+
+	post := func() (int, string, error) {
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			return 0, "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body), err
+	}
+
+	if status, body, err := post(); err != nil || status != http.StatusOK || body != `{"provider":"backup"}` {
+		t.Fatalf("initial response = (%d, %s, %v), want backup success", status, body, err)
+	}
+
+	const concurrentRequests = 8
+	results := make(chan struct {
+		status int
+		body   string
+		err    error
+	}, concurrentRequests)
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(concurrentRequests)
+	for range concurrentRequests {
+		go func() {
+			defer waitGroup.Done()
+			status, body, err := post()
+			results <- struct {
+				status int
+				body   string
+				err    error
+			}{status: status, body: body, err: err}
+		}()
+	}
+	waitGroup.Wait()
+	close(results)
+
+	for result := range results {
+		if result.err != nil || result.status != http.StatusOK || result.body != `{"provider":"backup"}` {
+			t.Fatalf("concurrent response = (%d, %s, %v), want backup success", result.status, result.body, result.err)
+		}
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1 while cooldown is active", got)
+	}
+	if got := backupHits.Load(); got != concurrentRequests+1 {
+		t.Fatalf("backup Provider received %d requests, want %d", got, concurrentRequests+1)
+	}
+}
+
+func TestChatCompletionsReturnsClientErrorsWithoutFailoverOrCooldown(t *testing.T) {
+	for _, testCase := range []struct {
+		statusCode int
+		body       string
+	}{
+		{statusCode: http.StatusBadRequest, body: `{"error":"bad request"}`},
+		{statusCode: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
+		{statusCode: http.StatusForbidden, body: `{"error":"forbidden"}`},
+		{statusCode: http.StatusNotFound, body: `{"error":"not found"}`},
+	} {
+		t.Run(fmt.Sprintf("status_%d", testCase.statusCode), func(t *testing.T) {
+			var primaryHits atomic.Int32
+			var backupHits atomic.Int32
+
+			primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Provider-Trace", "client-error")
+				w.Header().Set("Connection", "keep-alive")
+				w.WriteHeader(testCase.statusCode)
+				_, _ = io.WriteString(w, testCase.body)
+			}))
+			defer primaryProvider.Close()
+
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"provider":"backup"}`)
+			}))
+			defer backupProvider.Close()
+
+			server := newProxyServer(t, []providerFixture{
+				{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+				{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+			})
+			defer server.Close()
+
+			for requestNumber := 0; requestNumber < 2; requestNumber++ {
+				req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("proxy request: %v", err)
+				}
+				responseBody, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err != nil {
+					t.Fatalf("read response body: %v", err)
+				}
+				if resp.StatusCode != testCase.statusCode {
+					t.Fatalf("request %d status = %d, want %d", requestNumber+1, resp.StatusCode, testCase.statusCode)
+				}
+				if string(responseBody) != testCase.body {
+					t.Fatalf("request %d body = %s, want %s", requestNumber+1, responseBody, testCase.body)
+				}
+				if got := resp.Header.Get("Content-Type"); got != "application/json" {
+					t.Fatalf("request %d Content-Type = %q, want application/json", requestNumber+1, got)
+				}
+				if got := resp.Header.Get("X-Provider-Trace"); got != "client-error" {
+					t.Fatalf("request %d X-Provider-Trace = %q, want client-error", requestNumber+1, got)
+				}
+				if got := resp.Header.Get("Connection"); got != "" {
+					t.Fatalf("request %d Connection = %q, want hop-by-hop header excluded", requestNumber+1, got)
+				}
+			}
+
+			if got := primaryHits.Load(); got != 2 {
+				t.Fatalf("primary Provider received %d requests, want 2", got)
+			}
+			if got := backupHits.Load(); got != 0 {
+				t.Fatalf("backup Provider received %d requests, want 0", got)
+			}
+		})
+	}
+}
+
 func TestChatCompletionsIgnoresDownstreamAuthorization(t *testing.T) {
 	observedAuthorization := make(chan string, 2)
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -269,8 +752,24 @@ type upstreamObservation struct {
 
 func newProxyServer(t *testing.T, providers []providerFixture) *httptest.Server {
 	t.Helper()
+	return newProxyServerWithTimingValues(t, providers, "", "")
+}
+
+func newProxyServerWithTiming(t *testing.T, providers []providerFixture, cooldown, responseHeaderTimeout time.Duration) *httptest.Server {
+	t.Helper()
+	return newProxyServerWithTimingValues(t, providers, cooldown.String(), responseHeaderTimeout.String())
+}
+
+func newProxyServerWithTimingValues(t *testing.T, providers []providerFixture, cooldown, responseHeaderTimeout string) *httptest.Server {
+	t.Helper()
 
 	var yaml strings.Builder
+	if cooldown != "" {
+		fmt.Fprintf(&yaml, "cooldown: %s\n", cooldown)
+	}
+	if responseHeaderTimeout != "" {
+		fmt.Fprintf(&yaml, "response_header_timeout: %s\n", responseHeaderTimeout)
+	}
 	yaml.WriteString("providers:\n")
 	for _, provider := range providers {
 		fmt.Fprintf(&yaml, "  - base_url: %q\n", provider.baseURL)

@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/glaicer/gonka-proxy/internal/config"
 )
@@ -17,13 +19,16 @@ const chatCompletionsPath = "/v1/chat/completions"
 
 // Server implements the public OpenAI-compatible HTTP endpoint.
 type Server struct {
-	providers []provider
-	client    *http.Client
+	providers        []*provider
+	client           *http.Client
+	cooldownDuration time.Duration
+	cooldownMu       sync.Mutex
 }
 
 type provider struct {
 	config.Provider
-	chatURL string
+	chatURL       string
+	cooldownUntil time.Time
 }
 
 // New creates a proxy handler from validated configuration.
@@ -32,13 +37,13 @@ func New(cfg config.Config) (*Server, error) {
 		return nil, fmt.Errorf("invalid proxy config: %w", err)
 	}
 
-	providers := make([]provider, 0, len(cfg.Providers))
+	providers := make([]*provider, 0, len(cfg.Providers))
 	for _, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
-		providers = append(providers, provider{
+		providers = append(providers, &provider{
 			Provider: configuredProvider,
 			chatURL:  chatURL,
 		})
@@ -55,7 +60,8 @@ func New(cfg config.Config) (*Server, error) {
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
 	return &Server{
-		providers: providers,
+		providers:        providers,
+		cooldownDuration: cfg.Cooldown,
 		client: &http.Client{
 			Transport: transport,
 		},
@@ -88,39 +94,86 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	selected := s.providers[0]
-	upstreamBody, err := replaceVirtualModelWithAlias(body, selected.ModelAlias)
+	payload, err := decodeRequestBody(body)
 	if err != nil {
 		http.Error(w, "request body must be a JSON object", http.StatusBadRequest)
 		return
 	}
 
-	upstreamRequest, err := http.NewRequestWithContext(
-		r.Context(),
-		http.MethodPost,
-		selected.chatURL,
-		bytes.NewReader(upstreamBody),
-	)
-	if err != nil {
-		http.Error(w, "could not create upstream request", http.StatusBadGateway)
-		return
-	}
-	copyHeaders(upstreamRequest.Header, r.Header)
-	upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
+	s.route(w, r, payload)
+}
 
-	upstreamResponse, err := s.client.Do(upstreamRequest)
-	if err != nil {
-		if r.Context().Err() != nil {
+func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+	for _, selected := range s.providers {
+		if !s.providerAvailable(selected, time.Now()) {
+			continue
+		}
+
+		upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
+		if err != nil {
+			http.Error(w, "could not encode upstream request", http.StatusBadGateway)
 			return
 		}
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
+
+		upstreamRequest, err := http.NewRequestWithContext(
+			r.Context(),
+			http.MethodPost,
+			selected.chatURL,
+			bytes.NewReader(upstreamBody),
+		)
+		if err != nil {
+			http.Error(w, "could not create upstream request", http.StatusBadGateway)
+			return
+		}
+		copyHeaders(upstreamRequest.Header, r.Header)
+		upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
+
+		upstreamResponse, err := s.client.Do(upstreamRequest)
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			s.markCooldown(selected)
+			continue
+		}
+
+		if isFailoverStatus(upstreamResponse.StatusCode) {
+			_ = upstreamResponse.Body.Close()
+			s.markCooldown(selected)
+			continue
+		}
+
+		defer upstreamResponse.Body.Close()
+		copyHeaders(w.Header(), upstreamResponse.Header)
+		w.WriteHeader(upstreamResponse.StatusCode)
+		_, _ = io.Copy(w, upstreamResponse.Body)
 		return
 	}
-	defer upstreamResponse.Body.Close()
 
-	copyHeaders(w.Header(), upstreamResponse.Header)
-	w.WriteHeader(upstreamResponse.StatusCode)
-	_, _ = io.Copy(w, upstreamResponse.Body)
+	if r.Context().Err() != nil {
+		return
+	}
+	http.Error(w, "all Providers failed", http.StatusBadGateway)
+}
+
+func (s *Server) providerAvailable(selected *provider, now time.Time) bool {
+	s.cooldownMu.Lock()
+	defer s.cooldownMu.Unlock()
+	return !now.Before(selected.cooldownUntil)
+}
+
+func (s *Server) markCooldown(selected *provider) {
+	cooldownUntil := time.Now().Add(s.cooldownDuration)
+	s.cooldownMu.Lock()
+	if cooldownUntil.After(selected.cooldownUntil) {
+		selected.cooldownUntil = cooldownUntil
+	}
+	s.cooldownMu.Unlock()
+}
+
+func isFailoverStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		(statusCode >= http.StatusInternalServerError && statusCode <= 599)
 }
 
 func chatCompletionsURL(baseURL string) (string, error) {
@@ -134,17 +187,25 @@ func chatCompletionsURL(baseURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func replaceVirtualModelWithAlias(body []byte, modelAlias string) ([]byte, error) {
+func decodeRequestBody(body []byte) (map[string]json.RawMessage, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
 		return nil, fmt.Errorf("decode request body")
+	}
+	return payload, nil
+}
+
+func replaceVirtualModelWithAlias(payload map[string]json.RawMessage, modelAlias string) ([]byte, error) {
+	forwardedPayload := make(map[string]json.RawMessage, len(payload)+1)
+	for key, value := range payload {
+		forwardedPayload[key] = value
 	}
 	encodedModelAlias, err := json.Marshal(modelAlias)
 	if err != nil {
 		return nil, fmt.Errorf("encode model alias: %w", err)
 	}
-	payload["model"] = encodedModelAlias
-	return json.Marshal(payload)
+	forwardedPayload["model"] = encodedModelAlias
+	return json.Marshal(forwardedPayload)
 }
 
 func copyHeaders(destination, source http.Header) {
