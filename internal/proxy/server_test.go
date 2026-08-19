@@ -1,11 +1,13 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,165 @@ import (
 	"github.com/glaicer/gonka-proxy/internal/config"
 	"github.com/glaicer/gonka-proxy/internal/proxy"
 )
+
+func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"upstream-response-secret"}`)
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"upstream-response-secret"}`)
+	}))
+	defer backupProvider.Close()
+
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Minute,
+		ResponseHeaderTimeout: time.Second,
+		Providers: []config.Provider{
+			{BaseURL: primaryProvider.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100},
+			{BaseURL: backupProvider.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50},
+		},
+	}, logger)
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requestBody := `{"model":"virtual-model","messages":[{"role":"user","content":"do-not-log"}]}`
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	output := logs.String()
+	for _, expected := range []string{
+		"provider selected provider=0 priority=100",
+		"failover failure provider=0 category=rate-limit status=429",
+		"cooldown entered provider=0",
+		"provider selected provider=1 priority=50",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("logs = %q, want %q", output, expected)
+		}
+	}
+	for _, secret := range []string{"primary-secret", "backup-secret", "do-not-log", "upstream-response-secret"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("logs contain sensitive value %q: %q", secret, output)
+		}
+	}
+}
+
+func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
+	logs := &recoveryWaitLogWriter{started: make(chan struct{})}
+	logger := log.New(logs, "", 0)
+	failoverFailure := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(failoverFailure)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Hour,
+		RecoveryWait:          time.Hour,
+		ResponseHeaderTimeout: time.Second,
+		Providers: []config.Provider{
+			{BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
+		},
+	}, logger)
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	requestResult := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestResult <- requestErr
+	}()
+
+	select {
+	case <-failoverFailure:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Failover Failure")
+	}
+	select {
+	case <-logs.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Recovery Wait")
+	}
+	cancel()
+	select {
+	case <-requestResult:
+	case <-time.After(time.Second):
+		t.Fatal("canceled request did not finish")
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "recovery wait started duration=1h0m0s") {
+		t.Errorf("logs = %q, want Recovery Wait start", output)
+	}
+	if !strings.Contains(output, "recovery wait canceled") {
+		t.Errorf("logs = %q, want Recovery Wait cancellation", output)
+	}
+	if strings.Contains(output, "provider-secret") {
+		t.Errorf("logs contain Provider API key: %q", output)
+	}
+}
+
+type recoveryWaitLogWriter struct {
+	mu      sync.Mutex
+	buffer  bytes.Buffer
+	started chan struct{}
+	once    sync.Once
+}
+
+func (w *recoveryWaitLogWriter) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	count, err := w.buffer.Write(value)
+	if bytes.Contains(value, []byte("recovery wait started")) {
+		w.once.Do(func() {
+			close(w.started)
+		})
+	}
+	return count, err
+}
+
+func (w *recoveryWaitLogWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.String()
+}
 
 func TestChatCompletionsUsesHighestPriorityProvider(t *testing.T) {
 	var lowHits atomic.Int32

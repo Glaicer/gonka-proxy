@@ -1,0 +1,23 @@
+services:
+  fake-provider:
+    build: ./smoke/fake-provider
+    expose:
+      - "8081"
+    volumes:
+      - smoke-ca:/run/smoke
+
+  gonka-proxy:
+    build: .
+    command: ["--config", "/etc/gonka-proxy/config.yaml"]
+    depends_on:
+      - fake-provider
+    environment:
+      SSL_CERT_FILE: /run/smoke/ca.crt
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - ./smoke/config.yaml:/etc/gonka-proxy/config.yaml:ro
+      - smoke-ca:/run/smoke:ro
+
+volumes:
+  smoke-ca:

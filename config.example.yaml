@@ -1,12 +1,13 @@
 server:
   listen_address: 0.0.0.0:8080
 
-# These values default to 120s, 30s, and 60s when omitted.
+# These values default to 120s, 30s, and 60s when omitted. Changes apply after restart.
 cooldown: 120s
 recovery_wait: 30s
 response_header_timeout: 60s
 
 providers:
+  # These are placeholders, not real credentials.
   - base_url: https://provider.example/v1
     api_key: replace-with-provider-key
     model_alias: provider-model-name

@@ -1,0 +1,8 @@
+.git
+.codegraph
+.scratch
+.agents
+.codex
+config.yaml
+*.test
+coverage.out

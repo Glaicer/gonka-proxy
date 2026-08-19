@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -19,6 +20,11 @@ import (
 
 const chatCompletionsPath = "/v1/chat/completions"
 
+// Logger is the operational logging surface used by the proxy.
+type Logger interface {
+	Printf(format string, args ...any)
+}
+
 // Server implements the public OpenAI-compatible HTTP endpoint.
 type Server struct {
 	providers        []*provider
@@ -27,29 +33,40 @@ type Server struct {
 	recoveryWait     time.Duration
 	cooldownMu       sync.Mutex
 	cooldownVersion  uint64
+	logger           Logger
 }
 
 type provider struct {
 	config.Provider
-	chatURL          string
-	cooldownUntil    time.Time
-	cooldownVersion  uint64
+	index           int
+	chatURL         string
+	cooldownUntil   time.Time
+	cooldownVersion uint64
 }
 
 // New creates a proxy handler from validated configuration.
 func New(cfg config.Config) (*Server, error) {
+	return NewWithLogger(cfg, log.Default())
+}
+
+// NewWithLogger creates a proxy handler with an injected operational logger.
+func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid proxy config: %w", err)
 	}
+	if logger == nil {
+		logger = log.Default()
+	}
 
 	providers := make([]*provider, 0, len(cfg.Providers))
-	for _, configuredProvider := range cfg.Providers {
+	for index, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
 		providers = append(providers, &provider{
 			Provider: configuredProvider,
+			index:    index,
 			chatURL:  chatURL,
 		})
 	}
@@ -71,6 +88,7 @@ func New(cfg config.Config) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
+		logger: logger,
 	}, nil
 }
 
@@ -93,6 +111,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
+			s.logCancellation("request-body")
 			return
 		}
 		http.Error(w, "could not read request body", http.StatusBadRequest)
@@ -112,17 +131,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
 	for {
 		if r.Context().Err() != nil {
+			s.logCancellation("routing")
 			return
 		}
 
 		for _, selected := range s.providers {
 			if r.Context().Err() != nil {
+				s.logCancellation("routing")
 				return
 			}
 
 			if !s.providerAvailable(selected, time.Now()) {
 				continue
 			}
+			s.logger.Printf("provider selected provider=%d priority=%d", selected.index, selected.Priority)
 
 			upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
 			if err != nil {
@@ -146,15 +168,24 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			upstreamResponse, err := s.client.Do(upstreamRequest)
 			if err != nil {
 				if r.Context().Err() != nil {
+					s.logCancellation("upstream")
 					return
 				}
-				s.markCooldown(selected)
+				category := "network"
+				if isResponseHeaderTimeout(err) {
+					category = "response-header-timeout"
+				}
+				s.handleFailoverFailure(selected, category, 0)
 				continue
 			}
 
 			if isFailoverStatus(upstreamResponse.StatusCode) {
 				_ = upstreamResponse.Body.Close()
-				s.markCooldown(selected)
+				category := "server-error"
+				if upstreamResponse.StatusCode == http.StatusTooManyRequests {
+					category = "rate-limit"
+				}
+				s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 				continue
 			}
 
@@ -163,7 +194,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			copyHeaders(w.Header(), upstreamResponse.Header)
 			w.WriteHeader(upstreamResponse.StatusCode)
 			if streaming {
-				s.forwardStreamingResponse(w, r, selected, upstreamResponse.Body)
+				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
 				return
 			}
 			_, _ = io.Copy(w, upstreamResponse.Body)
@@ -178,6 +209,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 func (s *Server) waitForRecovery(ctx context.Context) bool {
 	cooldownVersions := s.snapshotCooldownVersions()
+	s.logger.Printf("recovery wait started duration=%s", s.recoveryWait)
 	timer := time.NewTimer(s.recoveryWait)
 	defer func() {
 		if !timer.Stop() {
@@ -190,12 +222,15 @@ func (s *Server) waitForRecovery(ctx context.Context) bool {
 
 	select {
 	case <-ctx.Done():
+		s.logger.Printf("recovery wait canceled")
 		return false
 	case <-timer.C:
 		if ctx.Err() != nil {
+			s.logger.Printf("recovery wait canceled")
 			return false
 		}
-		s.clearCooldowns(cooldownVersions)
+		cleared := s.clearCooldowns(cooldownVersions)
+		s.logger.Printf("recovery wait completed cooldowns_cleared=%d", cleared)
 		return true
 	}
 }
@@ -211,18 +246,27 @@ func (s *Server) snapshotCooldownVersions() map[*provider]uint64 {
 	return versions
 }
 
-func (s *Server) clearCooldowns(versions map[*provider]uint64) {
+func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	s.cooldownMu.Lock()
-	defer s.cooldownMu.Unlock()
+	cleared := make([]int, 0, len(s.providers))
 	for _, selected := range s.providers {
 		if selected.cooldownVersion != versions[selected] {
 			continue
 		}
+		if selected.cooldownUntil.IsZero() {
+			continue
+		}
 		selected.cooldownUntil = time.Time{}
+		cleared = append(cleared, selected.index)
 	}
+	s.cooldownMu.Unlock()
+	for _, index := range cleared {
+		s.logger.Printf("cooldown cleared provider=%d", index)
+	}
+	return len(cleared)
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, body io.Reader) {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -234,6 +278,9 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 		if readCount > 0 {
 			chunk := buffer[:readCount]
 			if _, writeErr := w.Write(chunk); writeErr != nil {
+				if r.Context().Err() != nil {
+					s.logCancellation("stream")
+				}
 				return
 			}
 			if canFlush {
@@ -247,9 +294,11 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 		if errors.Is(readErr, io.EOF) {
 			return
 		}
-		if r.Context().Err() == nil {
-			s.markCooldown(selected)
+		if r.Context().Err() != nil {
+			s.logCancellation("stream")
+			return
 		}
+		s.handleFailoverFailure(selected, "stream", statusCode)
 		return
 	}
 }
@@ -281,12 +330,39 @@ func (s *Server) providerAvailable(selected *provider, now time.Time) bool {
 func (s *Server) markCooldown(selected *provider) {
 	cooldownUntil := time.Now().Add(s.cooldownDuration)
 	s.cooldownMu.Lock()
+	previousCooldownUntil := selected.cooldownUntil
 	s.cooldownVersion = s.cooldownVersion + 1
 	selected.cooldownVersion = s.cooldownVersion
 	if cooldownUntil.After(selected.cooldownUntil) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
+	transition := "entered"
+	if time.Now().Before(previousCooldownUntil) {
+		transition = "extended"
+	}
+	s.logger.Printf("cooldown %s provider=%d duration=%s", transition, selected.index, s.cooldownDuration)
+}
+
+func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
+	if statusCode > 0 {
+		s.logger.Printf("failover failure provider=%d category=%s status=%d", selected.index, category, statusCode)
+	} else {
+		s.logger.Printf("failover failure provider=%d category=%s", selected.index, category)
+	}
+	s.markCooldown(selected)
+}
+
+func (s *Server) logCancellation(phase string) {
+	s.logger.Printf("request canceled phase=%s", phase)
+}
+
+func isResponseHeaderTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeoutError interface{ Timeout() bool }
+	return errors.As(err, &timeoutError) && timeoutError.Timeout()
 }
 
 func isFailoverStatus(statusCode int) bool {

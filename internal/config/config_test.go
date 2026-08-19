@@ -66,6 +66,85 @@ func TestLoadRejectsProviderWithoutPriority(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidStartupConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		want     string
+	}{
+		{
+			name:     "malformed YAML",
+			contents: "providers:\n  - [",
+			want:     "decode config",
+		},
+		{
+			name: "invalid duration",
+			contents: `cooldown: soon
+providers:
+  - base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`,
+			want: "cooldown must be a valid duration",
+		},
+		{
+			name: "missing API key",
+			contents: `providers:
+  - base_url: https://provider.example/v1
+    model_alias: provider-model
+    priority: 10
+`,
+			want: "providers[0].api_key must not be empty",
+		},
+		{
+			name: "duplicate Provider",
+			contents: `providers:
+  - base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+  - base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`,
+			want: "providers[1] duplicates another Provider definition",
+		},
+		{
+			name: "unusable Provider URL",
+			contents: `providers:
+  - base_url: ftp://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`,
+			want: "providers[0].base_url must use http or https",
+		},
+		{
+			name:     "empty Provider list",
+			contents: "providers: []\n",
+			want:     "providers must contain at least one Provider",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(test.contents), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := config.Load(configPath)
+			if err == nil {
+				t.Fatal("Load succeeded for invalid configuration")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %q, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
 func loadConfig(t *testing.T, contents string) config.Config {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
