@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,7 +29,7 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 
 	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":"upstream-response-secret"}`)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited","details":"upstream-response-secret"}}`)
 	}))
 	defer primaryProvider.Close()
 
@@ -44,8 +45,8 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 		RecoveryWait:          time.Minute,
 		ResponseHeaderTimeout: time.Second,
 		Providers: []config.Provider{
-			{BaseURL: primaryProvider.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100},
-			{BaseURL: backupProvider.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50},
+			{Name: "primary", BaseURL: primaryProvider.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100},
+			{Name: "backup", BaseURL: backupProvider.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50},
 		},
 	}, logger)
 	if err != nil {
@@ -66,14 +67,17 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 
 	output := logs.String()
 	for _, expected := range []string{
-		"provider selected provider=0 priority=100",
-		"failover failure provider=0 category=rate-limit status=429",
-		"cooldown entered provider=0",
-		"provider selected provider=1 priority=50",
+		"provider=primary info=\"provider selected\" priority=100",
+		"provider=primary status=429 response_code=429 error=\"rate limited\"",
+		"provider=primary info=\"provider cooldown set\"",
+		"provider=backup info=\"provider selected\" priority=50",
 	} {
 		if !strings.Contains(output, expected) {
 			t.Errorf("logs = %q, want %q", output, expected)
 		}
+	}
+	if !regexp.MustCompile(`timestamp=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}`).MatchString(output) {
+		t.Errorf("logs = %q, want human-readable timestamp", output)
 	}
 	for _, secret := range []string{"primary-secret", "backup-secret", "do-not-log", "upstream-response-secret"} {
 		if strings.Contains(output, secret) {
@@ -83,7 +87,7 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 }
 
 func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
-	logs := &recoveryWaitLogWriter{started: make(chan struct{})}
+	logs := &recoveryWaitLogWriter{started: make(chan struct{}), canceled: make(chan struct{})}
 	logger := log.New(logs, "", 0)
 	failoverFailure := make(chan struct{})
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,7 +102,7 @@ func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 		RecoveryWait:          time.Hour,
 		ResponseHeaderTimeout: time.Second,
 		Providers: []config.Provider{
-			{BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
+			{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
 		},
 	}, logger)
 	if err != nil {
@@ -143,9 +147,14 @@ func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled request did not finish")
 	}
+	select {
+	case <-logs.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Recovery Wait cancellation log")
+	}
 
 	output := logs.String()
-	if !strings.Contains(output, "recovery wait started duration=1h0m0s") {
+	if !strings.Contains(output, `info="recovery wait started" duration=1h0m0s`) {
 		t.Errorf("logs = %q, want Recovery Wait start", output)
 	}
 	if !strings.Contains(output, "recovery wait canceled") {
@@ -157,10 +166,12 @@ func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 }
 
 type recoveryWaitLogWriter struct {
-	mu      sync.Mutex
-	buffer  bytes.Buffer
-	started chan struct{}
-	once    sync.Once
+	mu           sync.Mutex
+	buffer       bytes.Buffer
+	started      chan struct{}
+	canceled     chan struct{}
+	startedOnce  sync.Once
+	canceledOnce sync.Once
 }
 
 func (w *recoveryWaitLogWriter) Write(value []byte) (int, error) {
@@ -168,8 +179,13 @@ func (w *recoveryWaitLogWriter) Write(value []byte) (int, error) {
 	defer w.mu.Unlock()
 	count, err := w.buffer.Write(value)
 	if bytes.Contains(value, []byte("recovery wait started")) {
-		w.once.Do(func() {
+		w.startedOnce.Do(func() {
 			close(w.started)
+		})
+	}
+	if bytes.Contains(value, []byte("recovery wait canceled")) {
+		w.canceledOnce.Do(func() {
+			close(w.canceled)
 		})
 	}
 	return count, err
@@ -1439,6 +1455,7 @@ func TestChatCompletionsCancelsStreamingProviderOnClientCancellation(t *testing.
 }
 
 type providerFixture struct {
+	name       string
 	baseURL    string
 	apiKey     string
 	modelAlias string
@@ -1485,8 +1502,13 @@ func newProxyServerWithTimingValuesAndRecovery(t *testing.T, providers []provide
 		fmt.Fprintf(&yaml, "response_header_timeout: %s\n", responseHeaderTimeout)
 	}
 	yaml.WriteString("providers:\n")
-	for _, provider := range providers {
-		fmt.Fprintf(&yaml, "  - base_url: %q\n", provider.baseURL)
+	for index, provider := range providers {
+		name := provider.name
+		if name == "" {
+			name = fmt.Sprintf("provider-%d", index)
+		}
+		fmt.Fprintf(&yaml, "  - name: %q\n", name)
+		fmt.Fprintf(&yaml, "    base_url: %q\n", provider.baseURL)
 		fmt.Fprintf(&yaml, "    api_key: %q\n", provider.apiKey)
 		fmt.Fprintf(&yaml, "    model_alias: %q\n", provider.modelAlias)
 		fmt.Fprintf(&yaml, "    priority: %d\n", provider.priority)

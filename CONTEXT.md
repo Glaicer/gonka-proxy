@@ -5,7 +5,7 @@ Gonka Proxy routes OpenAI-compatible inference requests across prioritized provi
 ## Language
 
 **Provider**:
-An OpenAI-compatible inference endpoint configured with a base URL, API key, model alias, and priority.
+An OpenAI-compatible inference endpoint configured with a human-readable name, base URL, API key, model alias, and priority.
 
 **Virtual Model**:
 The model name sent by the client. It identifies the proxy configuration rather than an upstream model and is not forwarded to providers.

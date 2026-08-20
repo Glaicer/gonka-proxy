@@ -26,14 +26,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, *configPath, log.Default()); err != nil {
-		log.Fatal(err)
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+	if err := run(ctx, *configPath, logger); err != nil {
+		logger.Printf("error=%v", err)
+		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, configPath string, logger proxy.Logger) error {
 	if logger == nil {
-		logger = log.Default()
+		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {

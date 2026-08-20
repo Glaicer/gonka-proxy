@@ -6,7 +6,8 @@ recovery_wait: 1s
 response_header_timeout: 5s
 
 providers:
-  - base_url: https://fake-provider:8081/v1
+  - name: fake-provider
+    base_url: https://fake-provider:8081/v1
     api_key: smoke-provider-key
     model_alias: smoke-model
     priority: 100

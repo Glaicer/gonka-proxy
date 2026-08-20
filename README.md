@@ -6,7 +6,7 @@ Gonka Proxy exposes one local OpenAI-compatible endpoint and forwards chat compl
 
 ```sh
 cp config.example.yaml config.yaml
-# Replace the example Provider URLs, keys, and model aliases.
+# Replace the example Provider names, URLs, keys, and model aliases.
 docker compose up --build
 ```
 

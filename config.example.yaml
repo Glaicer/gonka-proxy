@@ -8,11 +8,13 @@ response_header_timeout: 60s
 
 providers:
   # These are placeholders, not real credentials.
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     api_key: replace-with-provider-key
     model_alias: provider-model-name
     priority: 100
-  - base_url: https://backup.example/v1
+  - name: backup
+    base_url: https://backup.example/v1
     api_key: replace-with-provider-key
     model_alias: backup-model-name
     priority: 50

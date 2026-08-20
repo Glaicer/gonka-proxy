@@ -8,7 +8,7 @@ Copy the documented sample and replace every example Provider value:
 cp config.example.yaml config.yaml
 ```
 
-Each `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions`, replaces the incoming Virtual Model with `model_alias`, and sends the Provider's `api_key` upstream.
+Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions`, replaces the incoming Virtual Model with `model_alias`, and sends the Provider's `api_key` upstream.
 
 Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
 
@@ -46,7 +46,7 @@ The `baseURL` intentionally ends in `/v1`. Do not configure individual upstream 
 
 ## Operational logs
 
-Logs identify the numeric Provider declaration index and priority, Failover Failure category, HTTP status when available, Cooldown transitions, Recovery Wait transitions, and request cancellation. They never include request bodies, response bodies, authorization headers, or Provider API keys.
+Logs are written to the container console with timestamps. They identify the Provider name, response code, and parsed upstream error message for non-`200` responses. They also report when a Provider enters or leaves Cooldown. Logs never include request bodies, response bodies, authorization headers, or Provider API keys.
 
 ## Container smoke test
 

@@ -20,6 +20,8 @@ import (
 
 const chatCompletionsPath = "/v1/chat/completions"
 
+const maxLoggedErrorMessageLength = 512
+
 // Logger is the operational logging surface used by the proxy.
 type Logger interface {
 	Printf(format string, args ...any)
@@ -38,7 +40,6 @@ type Server struct {
 
 type provider struct {
 	config.Provider
-	index           int
 	chatURL         string
 	cooldownUntil   time.Time
 	cooldownVersion uint64
@@ -59,14 +60,13 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	}
 
 	providers := make([]*provider, 0, len(cfg.Providers))
-	for index, configuredProvider := range cfg.Providers {
+	for _, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
 		providers = append(providers, &provider{
 			Provider: configuredProvider,
-			index:    index,
 			chatURL:  chatURL,
 		})
 	}
@@ -144,7 +144,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			if !s.providerAvailable(selected, time.Now()) {
 				continue
 			}
-			s.logger.Printf("provider selected provider=%d priority=%d", selected.index, selected.Priority)
+			s.logf("level=INFO provider=%s info=\"provider selected\" priority=%d", selected.Name, selected.Priority)
 
 			upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
 			if err != nil {
@@ -171,6 +171,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					s.logCancellation("upstream")
 					return
 				}
+				s.logProviderResponse(selected, 0, err.Error())
 				category := "network"
 				if isResponseHeaderTimeout(err) {
 					category = "response-header-timeout"
@@ -179,15 +180,31 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				continue
 			}
 
-			if isFailoverStatus(upstreamResponse.StatusCode) {
+			if upstreamResponse.StatusCode != http.StatusOK {
+				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
 				_ = upstreamResponse.Body.Close()
-				category := "server-error"
-				if upstreamResponse.StatusCode == http.StatusTooManyRequests {
-					category = "rate-limit"
+				errorMessage := errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
+				if readErr != nil {
+					errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
 				}
-				s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
-				continue
+				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
+
+				if isFailoverStatus(upstreamResponse.StatusCode) {
+					category := "server-error"
+					if upstreamResponse.StatusCode == http.StatusTooManyRequests {
+						category = "rate-limit"
+					}
+					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
+					continue
+				}
+
+				copyHeaders(w.Header(), upstreamResponse.Header)
+				w.WriteHeader(upstreamResponse.StatusCode)
+				_, _ = w.Write(responseBody)
+				return
 			}
+
+			s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
 
 			streaming := isStreamingResponse(upstreamResponse, payload)
 			defer upstreamResponse.Body.Close()
@@ -209,7 +226,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 func (s *Server) waitForRecovery(ctx context.Context) bool {
 	cooldownVersions := s.snapshotCooldownVersions()
-	s.logger.Printf("recovery wait started duration=%s", s.recoveryWait)
+	s.logf("level=INFO info=\"recovery wait started\" duration=%s", s.recoveryWait)
 	timer := time.NewTimer(s.recoveryWait)
 	defer func() {
 		if !timer.Stop() {
@@ -222,15 +239,15 @@ func (s *Server) waitForRecovery(ctx context.Context) bool {
 
 	select {
 	case <-ctx.Done():
-		s.logger.Printf("recovery wait canceled")
+		s.logf("level=INFO info=\"recovery wait canceled\"")
 		return false
 	case <-timer.C:
 		if ctx.Err() != nil {
-			s.logger.Printf("recovery wait canceled")
+			s.logf("level=INFO info=\"recovery wait canceled\"")
 			return false
 		}
 		cleared := s.clearCooldowns(cooldownVersions)
-		s.logger.Printf("recovery wait completed cooldowns_cleared=%d", cleared)
+		s.logf("level=INFO info=\"recovery wait completed\" cooldowns_cleared=%d", cleared)
 		return true
 	}
 }
@@ -248,7 +265,7 @@ func (s *Server) snapshotCooldownVersions() map[*provider]uint64 {
 
 func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	s.cooldownMu.Lock()
-	cleared := make([]int, 0, len(s.providers))
+	cleared := make([]*provider, 0, len(s.providers))
 	for _, selected := range s.providers {
 		if selected.cooldownVersion != versions[selected] {
 			continue
@@ -257,11 +274,11 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 			continue
 		}
 		selected.cooldownUntil = time.Time{}
-		cleared = append(cleared, selected.index)
+		cleared = append(cleared, selected)
 	}
 	s.cooldownMu.Unlock()
-	for _, index := range cleared {
-		s.logger.Printf("cooldown cleared provider=%d", index)
+	for _, selected := range cleared {
+		s.logf("level=INFO provider=%s info=\"provider cooldown cleared\"", selected.Name)
 	}
 	return len(cleared)
 }
@@ -341,20 +358,85 @@ func (s *Server) markCooldown(selected *provider) {
 	if time.Now().Before(previousCooldownUntil) {
 		transition = "extended"
 	}
-	s.logger.Printf("cooldown %s provider=%d duration=%s", transition, selected.index, s.cooldownDuration)
+	s.logf("level=INFO provider=%s info=\"provider cooldown set\" transition=%s duration=%s", selected.Name, transition, s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
 	if statusCode > 0 {
-		s.logger.Printf("failover failure provider=%d category=%s status=%d", selected.index, category, statusCode)
+		s.logf("level=WARN provider=%s info=\"failover failure\" category=%s status=%d", selected.Name, category, statusCode)
 	} else {
-		s.logger.Printf("failover failure provider=%d category=%s", selected.index, category)
+		s.logf("level=WARN provider=%s info=\"failover failure\" category=%s", selected.Name, category)
 	}
 	s.markCooldown(selected)
 }
 
 func (s *Server) logCancellation(phase string) {
-	s.logger.Printf("request canceled phase=%s", phase)
+	s.logf("level=INFO info=\"request canceled\" phase=%s", phase)
+}
+
+func (s *Server) logf(format string, args ...any) {
+	arguments := make([]any, 0, len(args)+1)
+	arguments = append(arguments, time.Now().Format(time.RFC3339))
+	arguments = append(arguments, args...)
+	s.logger.Printf("timestamp=%s "+format, arguments...)
+}
+
+func (s *Server) logProviderResponse(selected *provider, statusCode int, errorMessage string) {
+	if errorMessage == "" {
+		s.logf("provider=%s status=%d response_code=%d", selected.Name, statusCode, statusCode)
+		return
+	}
+	s.logf("level=ERROR provider=%s status=%d response_code=%d error=%q", selected.Name, statusCode, statusCode, sanitizeErrorMessage(errorMessage))
+}
+
+func errorMessageFromResponse(body []byte, statusCode int) string {
+	var payload struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  string          `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if len(payload.Error) > 0 && string(payload.Error) != "null" {
+			var errorText string
+			if json.Unmarshal(payload.Error, &errorText) == nil && strings.TrimSpace(errorText) != "" {
+				return sanitizeErrorMessage(errorText)
+			}
+
+			var structuredError struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(payload.Error, &structuredError) == nil && strings.TrimSpace(structuredError.Message) != "" {
+				return sanitizeErrorMessage(structuredError.Message)
+			}
+		}
+		if strings.TrimSpace(payload.Message) != "" {
+			return sanitizeErrorMessage(payload.Message)
+		}
+		if strings.TrimSpace(payload.Detail) != "" {
+			return sanitizeErrorMessage(payload.Detail)
+		}
+	}
+
+	return fmt.Sprintf("upstream returned HTTP %d", statusCode)
+}
+
+func sanitizeErrorMessage(message string) string {
+	message = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		default:
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}
+	}, message)
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) > maxLoggedErrorMessageLength {
+		message = message[:maxLoggedErrorMessageLength] + "..."
+	}
+	return message
 }
 
 func isResponseHeaderTimeout(err error) bool {

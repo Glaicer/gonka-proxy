@@ -30,6 +30,7 @@ type Config struct {
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
 type Provider struct {
+	Name       string
 	BaseURL    string
 	APIKey     string
 	ModelAlias string
@@ -49,6 +50,7 @@ type rawServer struct {
 }
 
 type rawProvider struct {
+	Name       string `yaml:"name"`
 	BaseURL    string `yaml:"base_url"`
 	APIKey     string `yaml:"api_key"`
 	ModelAlias string `yaml:"model_alias"`
@@ -131,6 +133,9 @@ func (c Config) Validate() error {
 
 	seen := make(map[providerIdentity]struct{}, len(c.Providers))
 	for index, provider := range c.Providers {
+		if strings.TrimSpace(provider.Name) == "" {
+			return fmt.Errorf("providers[%d].name must not be empty", index)
+		}
 		if strings.TrimSpace(provider.BaseURL) == "" {
 			return fmt.Errorf("providers[%d].base_url must not be empty", index)
 		}
@@ -193,6 +198,7 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	normalizedURL := strings.TrimRight(parsed.String(), "/")
 
 	provider := Provider{
+		Name:       strings.TrimSpace(raw.Name),
 		BaseURL:    normalizedURL,
 		APIKey:     strings.TrimSpace(raw.APIKey),
 		ModelAlias: strings.TrimSpace(raw.ModelAlias),

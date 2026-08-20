@@ -12,11 +12,16 @@ import (
 
 func TestLoadAppliesDocumentedDefaults(t *testing.T) {
 	cfg := loadConfig(t, `providers:
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10
 `)
+
+	if cfg.Providers[0].Name != "primary" {
+		t.Errorf("Provider name = %q, want %q", cfg.Providers[0].Name, "primary")
+	}
 
 	if cfg.ListenAddress != config.DefaultListenAddress {
 		t.Errorf("ListenAddress = %q, want %q", cfg.ListenAddress, config.DefaultListenAddress)
@@ -35,7 +40,8 @@ func TestLoadAppliesDocumentedDefaults(t *testing.T) {
 func TestLoadParsesRecoveryWait(t *testing.T) {
 	cfg := loadConfig(t, `recovery_wait: 25ms
 providers:
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10
@@ -49,7 +55,8 @@ providers:
 func TestLoadRejectsProviderWithoutPriority(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	contents := []byte(`providers:
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
 `)
@@ -81,7 +88,8 @@ func TestLoadRejectsInvalidStartupConfiguration(t *testing.T) {
 			name: "invalid duration",
 			contents: `cooldown: soon
 providers:
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10
@@ -91,20 +99,33 @@ providers:
 		{
 			name: "missing API key",
 			contents: `providers:
-  - base_url: https://provider.example/v1
+  - name: primary
+    base_url: https://provider.example/v1
     model_alias: provider-model
     priority: 10
 `,
 			want: "providers[0].api_key must not be empty",
 		},
 		{
-			name: "duplicate Provider",
+			name: "missing Provider name",
 			contents: `providers:
   - base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10
-  - base_url: https://provider.example/v1
+`,
+			want: "providers[0].name must not be empty",
+		},
+		{
+			name: "duplicate Provider",
+			contents: `providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+  - name: backup
+    base_url: https://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10
@@ -114,7 +135,8 @@ providers:
 		{
 			name: "unusable Provider URL",
 			contents: `providers:
-  - base_url: ftp://provider.example/v1
+  - name: primary
+    base_url: ftp://provider.example/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 10

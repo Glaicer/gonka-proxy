@@ -45,7 +45,8 @@ cooldown: 1h
 recovery_wait: 1h
 response_header_timeout: 1h
 providers:
-  - base_url: %s/v1
+  - name: primary
+    base_url: %s/v1
     api_key: provider-secret
     model_alias: provider-model
     priority: 1
