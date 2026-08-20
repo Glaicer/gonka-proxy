@@ -17,7 +17,34 @@ const (
 	DefaultCooldown              = 120 * time.Second
 	DefaultRecoveryWait          = 30 * time.Second
 	DefaultResponseHeaderTimeout = 60 * time.Second
+	DefaultLogLevel              = "INFO"
 )
+
+// LogLevel is a configurable minimum severity threshold. Lines at or above
+// this threshold are emitted. Valid values are INFO, WARN, and ERROR.
+type LogLevel string
+
+const (
+	LogLevelInfo  LogLevel = "INFO"
+	LogLevelWarn  LogLevel = "WARN"
+	LogLevelError LogLevel = "ERROR"
+)
+
+func (l LogLevel) severity() int {
+	switch l {
+	case LogLevelError:
+		return 30
+	case LogLevelWarn:
+		return 20
+	default:
+		return 10
+	}
+}
+
+// Enabled reports whether a line at the given level passes this threshold.
+func (l LogLevel) Enabled(level LogLevel) bool {
+	return level.severity() >= l.severity()
+}
 
 // Config is the validated runtime configuration for the proxy.
 type Config struct {
@@ -25,6 +52,7 @@ type Config struct {
 	Cooldown              time.Duration
 	RecoveryWait          time.Duration
 	ResponseHeaderTimeout time.Duration
+	LogLevel              LogLevel
 	Providers             []Provider
 }
 
@@ -42,6 +70,7 @@ type rawConfig struct {
 	Cooldown              string        `yaml:"cooldown"`
 	RecoveryWait          string        `yaml:"recovery_wait"`
 	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
+	LogLevel              string        `yaml:"log_level"`
 	Providers             []rawProvider `yaml:"providers"`
 }
 
@@ -84,6 +113,7 @@ func Load(path string) (Config, error) {
 		Cooldown:              0,
 		RecoveryWait:          0,
 		ResponseHeaderTimeout: 0,
+		LogLevel:              LogLevelInfo,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 	}
 	if cfg.ListenAddress == "" {
@@ -97,6 +127,9 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ResponseHeaderTimeout, err = parseDuration("response_header_timeout", raw.ResponseHeaderTimeout, DefaultResponseHeaderTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.LogLevel, err = parseLogLevel(raw.LogLevel); err != nil {
 		return Config{}, err
 	}
 
@@ -182,6 +215,21 @@ func parseDuration(field, value string, defaultValue time.Duration) (time.Durati
 		return 0, fmt.Errorf("%s must be greater than zero", field)
 	}
 	return duration, nil
+}
+
+func parseLogLevel(value string) (LogLevel, error) {
+	switch LogLevel(strings.ToUpper(strings.TrimSpace(value))) {
+	case "":
+		return LogLevelInfo, nil
+	case LogLevelInfo:
+		return LogLevelInfo, nil
+	case LogLevelWarn:
+		return LogLevelWarn, nil
+	case LogLevelError:
+		return LogLevelError, nil
+	default:
+		return "", fmt.Errorf("log_level must be one of INFO, WARN, or ERROR")
+	}
 }
 
 func normalizeProvider(index int, raw rawProvider) (Provider, error) {

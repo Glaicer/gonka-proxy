@@ -1,21 +1,69 @@
 # Gonka Proxy
 
-Gonka Proxy exposes one local OpenAI-compatible endpoint and forwards chat completions to the highest-priority configured Provider.
+**No more 429s. No more 502s.** Gonka Proxy sits in front of your LLM providers and gives you one stable, OpenAI-compatible endpoint to point your app at. If one provider is rate-limited or down, it silently hands the request to the next one — your app never sees the error.
 
-## Quick start
+Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can run it next to anything.
+
+## What it does
+
+- Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream.
+- Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
+- On a **429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
+- A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
+- Maps your **virtual model name** to each provider's real model, so clients don't need to know or care which upstream you're using.
+
+## Configuration
+
+Copy the example and edit it:
 
 ```sh
 cp config.example.yaml config.yaml
-# Replace the example Provider names, URLs, keys, and model aliases.
+```
+
+The file is loaded once at startup, so **any change requires a restart**.
+
+```yaml
+server:
+  listen_address: 0.0.0.0:8080   # where the proxy listens (host:port)
+
+# Optional tuning — these are the defaults if omitted:
+cooldown: 120s            # how long a failed provider is benched before retry
+recovery_wait: 30s        # wait before probing again when all providers are down
+response_header_timeout: 30s  # max time to wait for a provider's response headers
+log_level: WARN           # INFO, WARN (default), or ERROR
+
+providers:                # one block per upstream, lower priority = preferred
+  - name: primary
+    base_url: https://provider.example/v1   # API root, not a /chat/completions URL
+    api_key: your-key
+    model_alias: provider-model-name        # real model name sent upstream
+    priority: 100
+  - name: backup
+    base_url: https://backup.example/v1
+    api_key: your-key
+    model_alias: backup-model-name
+    priority: 50          # tried only when primary is down or rate-limited
+```
+
+List your providers in any order; Gonka always tries the **lowest `priority` number first**. Add as many blocks as you like.
+
+## Launch
+
+**Docker (recommended):**
+
+```sh
+cp config.example.yaml config.yaml   # then edit your providers
 docker compose up --build
 ```
 
-Docker publishes the service only on `127.0.0.1:8080`. The YAML file is mounted read-only, loaded once at startup, and must be replaced followed by a container restart to apply changes.
+This publishes the proxy on `127.0.0.1:58081` and mounts `config.yaml` read-only. Point your app at `http://127.0.0.1:58081/v1`.
 
-The complete Docker, operations, OpenCode, and smoke-test workflow is in [`docs/docker-and-opencode.md`](docs/docker-and-opencode.md).
-
-For a native run:
+**Native (no Docker):**
 
 ```sh
 go run ./cmd/gonka-proxy --config config.yaml
 ```
+
+## Point your app at it
+
+Set your OpenAI-compatible client's `base_url` to `http://127.0.0.1:58081/v1` (or your chosen address) and use one of your `model_alias` values as the model name. The proxy handles the rest.

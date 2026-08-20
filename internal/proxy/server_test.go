@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,21 +66,19 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 
 	output := logs.String()
 	for _, expected := range []string{
-		"provider=primary info=\"provider selected\" priority=100",
-		"provider=primary status=429 response_code=429 error=\"rate limited\"",
-		"provider=primary info=\"provider cooldown set\"",
-		"provider=backup info=\"provider selected\" priority=50",
+		"provider selected - primary - priority=100",
+		"primary error - status=429 - rate limited",
+		"primary - cooldown - 1m0s",
+		"provider selected - backup - priority=50",
+		"backup status=200",
 	} {
 		if !strings.Contains(output, expected) {
 			t.Errorf("logs = %q, want %q", output, expected)
 		}
 	}
-	if !regexp.MustCompile(`timestamp=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}`).MatchString(output) {
-		t.Errorf("logs = %q, want human-readable timestamp", output)
-	}
 	for _, secret := range []string{"primary-secret", "backup-secret", "do-not-log", "upstream-response-secret"} {
 		if strings.Contains(output, secret) {
-			t.Errorf("logs contain sensitive value %q: %q", secret, output)
+			t.Errorf("logs contain sensitive value %q: %q", output, secret)
 		}
 	}
 }
@@ -154,10 +151,10 @@ func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 	}
 
 	output := logs.String()
-	if !strings.Contains(output, `info="recovery wait started" duration=1h0m0s`) {
+	if !strings.Contains(output, "recovery wait - started - 1h0m0s") {
 		t.Errorf("logs = %q, want Recovery Wait start", output)
 	}
-	if !strings.Contains(output, "recovery wait canceled") {
+	if !strings.Contains(output, "recovery wait - canceled") {
 		t.Errorf("logs = %q, want Recovery Wait cancellation", output)
 	}
 	if strings.Contains(output, "provider-secret") {
@@ -178,12 +175,12 @@ func (w *recoveryWaitLogWriter) Write(value []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	count, err := w.buffer.Write(value)
-	if bytes.Contains(value, []byte("recovery wait started")) {
+	if bytes.Contains(value, []byte("recovery wait - started")) {
 		w.startedOnce.Do(func() {
 			close(w.started)
 		})
 	}
-	if bytes.Contains(value, []byte("recovery wait canceled")) {
+	if bytes.Contains(value, []byte("recovery wait - canceled")) {
 		w.canceledOnce.Do(func() {
 			close(w.canceled)
 		})

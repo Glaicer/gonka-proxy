@@ -36,6 +36,7 @@ type Server struct {
 	cooldownMu       sync.Mutex
 	cooldownVersion  uint64
 	logger           Logger
+	logLevel         config.LogLevel
 }
 
 type provider struct {
@@ -88,7 +89,8 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
-		logger: logger,
+		logger:   logger,
+		logLevel: cfg.LogLevel,
 	}, nil
 }
 
@@ -144,7 +146,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			if !s.providerAvailable(selected, time.Now()) {
 				continue
 			}
-			s.logf("level=INFO provider=%s info=\"provider selected\" priority=%d", selected.Name, selected.Priority)
+			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", selected.Name, selected.Priority)
 
 			upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
 			if err != nil {
@@ -226,7 +228,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 func (s *Server) waitForRecovery(ctx context.Context) bool {
 	cooldownVersions := s.snapshotCooldownVersions()
-	s.logf("level=INFO info=\"recovery wait started\" duration=%s", s.recoveryWait)
+	s.logAt(config.LogLevelInfo, "recovery wait - started - %s", s.recoveryWait)
 	timer := time.NewTimer(s.recoveryWait)
 	defer func() {
 		if !timer.Stop() {
@@ -239,15 +241,15 @@ func (s *Server) waitForRecovery(ctx context.Context) bool {
 
 	select {
 	case <-ctx.Done():
-		s.logf("level=INFO info=\"recovery wait canceled\"")
+		s.logAt(config.LogLevelInfo, "recovery wait - canceled")
 		return false
 	case <-timer.C:
 		if ctx.Err() != nil {
-			s.logf("level=INFO info=\"recovery wait canceled\"")
+			s.logAt(config.LogLevelInfo, "recovery wait - canceled")
 			return false
 		}
 		cleared := s.clearCooldowns(cooldownVersions)
-		s.logf("level=INFO info=\"recovery wait completed\" cooldowns_cleared=%d", cleared)
+		s.logAt(config.LogLevelInfo, "recovery wait - completed - cleared=%d", cleared)
 		return true
 	}
 }
@@ -278,7 +280,7 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	}
 	s.cooldownMu.Unlock()
 	for _, selected := range cleared {
-		s.logf("level=INFO provider=%s info=\"provider cooldown cleared\"", selected.Name)
+		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", selected.Name)
 	}
 	return len(cleared)
 }
@@ -347,46 +349,47 @@ func (s *Server) providerAvailable(selected *provider, now time.Time) bool {
 func (s *Server) markCooldown(selected *provider) {
 	cooldownUntil := time.Now().Add(s.cooldownDuration)
 	s.cooldownMu.Lock()
-	previousCooldownUntil := selected.cooldownUntil
 	s.cooldownVersion = s.cooldownVersion + 1
 	selected.cooldownVersion = s.cooldownVersion
 	if cooldownUntil.After(selected.cooldownUntil) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
-	transition := "entered"
-	if time.Now().Before(previousCooldownUntil) {
-		transition = "extended"
-	}
-	s.logf("level=INFO provider=%s info=\"provider cooldown set\" transition=%s duration=%s", selected.Name, transition, s.cooldownDuration)
+	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", selected.Name, s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
 	if statusCode > 0 {
-		s.logf("level=WARN provider=%s info=\"failover failure\" category=%s status=%d", selected.Name, category, statusCode)
+		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", selected.Name, category, statusCode)
 	} else {
-		s.logf("level=WARN provider=%s info=\"failover failure\" category=%s", selected.Name, category)
+		s.logAt(config.LogLevelWarn, "%s - failover - %s", selected.Name, category)
 	}
 	s.markCooldown(selected)
 }
 
 func (s *Server) logCancellation(phase string) {
-	s.logf("level=INFO info=\"request canceled\" phase=%s", phase)
+	s.logAt(config.LogLevelInfo, "request canceled - %s", phase)
 }
 
+// logf writes a line unconditionally (used for always-on operational output).
 func (s *Server) logf(format string, args ...any) {
-	arguments := make([]any, 0, len(args)+1)
-	arguments = append(arguments, time.Now().Format(time.RFC3339))
-	arguments = append(arguments, args...)
-	s.logger.Printf("timestamp=%s "+format, arguments...)
+	s.logger.Printf(format, args...)
+}
+
+// logAt writes a line only if the configured level permits it.
+func (s *Server) logAt(level config.LogLevel, format string, args ...any) {
+	if !s.logLevel.Enabled(level) {
+		return
+	}
+	s.logger.Printf(format, args...)
 }
 
 func (s *Server) logProviderResponse(selected *provider, statusCode int, errorMessage string) {
 	if errorMessage == "" {
-		s.logf("provider=%s status=%d response_code=%d", selected.Name, statusCode, statusCode)
+		s.logf("%s status=%d", selected.Name, statusCode)
 		return
 	}
-	s.logf("level=ERROR provider=%s status=%d response_code=%d error=%q", selected.Name, statusCode, statusCode, sanitizeErrorMessage(errorMessage))
+	s.logAt(config.LogLevelError, "%s error - status=%d - %s", selected.Name, statusCode, sanitizeErrorMessage(errorMessage))
 }
 
 func errorMessageFromResponse(body []byte, statusCode int) string {

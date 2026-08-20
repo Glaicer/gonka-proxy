@@ -1,13 +1,26 @@
+# Top-level server configuration block.
 server:
+  # Address and port the HTTP server binds to. Format: host:port.
   listen_address: 0.0.0.0:8080
 
 # These values default to 120s, 30s, and 60s when omitted. Changes apply after restart.
+# How long to wait after a provider failure before allowing it to be retried.
 cooldown: 120s
+# How long to wait before probing a recovered provider again.
 recovery_wait: 30s
-response_header_timeout: 60s
+# Max time to wait for response headers from an upstream provider before timing out.
+response_header_timeout: 30s
 
+# Minimum severity to log: INFO, WARN (default), or ERROR. Provider response
+# lines are always logged regardless of this setting.
+# Minimum log level to emit (INFO, WARN, or ERROR).
+log_level: WARN
+
+# List of upstream LLM providers the proxy can route to. These are placeholders,
+# not real credentials. Each entry: name (unique id), base_url (API endpoint),
+# api_key (auth), model_alias (model name to match requests against), priority
+# (lower = preferred). Copy a block to add another provider.
 providers:
-  # These are placeholders, not real credentials.
   - name: primary
     base_url: https://provider.example/v1
     api_key: replace-with-provider-key

@@ -35,6 +35,9 @@ func TestLoadAppliesDocumentedDefaults(t *testing.T) {
 	if cfg.ResponseHeaderTimeout != config.DefaultResponseHeaderTimeout {
 		t.Errorf("ResponseHeaderTimeout = %s, want %s", cfg.ResponseHeaderTimeout, config.DefaultResponseHeaderTimeout)
 	}
+	if cfg.LogLevel != config.LogLevelInfo {
+		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, config.LogLevelInfo)
+	}
 }
 
 func TestLoadParsesRecoveryWait(t *testing.T) {
@@ -49,6 +52,57 @@ providers:
 
 	if cfg.RecoveryWait != 25*time.Millisecond {
 		t.Errorf("RecoveryWait = %s, want 25ms", cfg.RecoveryWait)
+	}
+}
+
+func TestLoadParsesLogLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    config.LogLevel
+		wantErr string
+	}{
+		{name: "info", value: "INFO", want: config.LogLevelInfo},
+		{name: "warn lowercase", value: "warn", want: config.LogLevelWarn},
+		{name: "error", value: "ERROR", want: config.LogLevelError},
+		{name: "invalid", value: "DEBUG", wantErr: "log_level must be one of INFO, WARN, or ERROR"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			contents := "log_level: " + test.value + "\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n"
+			if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := config.Load(configPath)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want error containing %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %q, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.LogLevel != test.want {
+				t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, test.want)
+			}
+		})
+	}
+}
+
+func TestLogLevelEnabledThreshold(t *testing.T) {
+	if !config.LogLevelInfo.Enabled(config.LogLevelInfo) {
+		t.Error("INFO level should be enabled at INFO threshold")
+	}
+	if !config.LogLevelWarn.Enabled(config.LogLevelError) {
+		t.Error("ERROR should be enabled at WARN threshold")
+	}
+	if config.LogLevelWarn.Enabled(config.LogLevelInfo) {
+		t.Error("INFO should be suppressed at WARN threshold")
 	}
 }
 
