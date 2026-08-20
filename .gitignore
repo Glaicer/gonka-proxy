@@ -1,0 +1,27 @@
+# Local config with real credentials (never commit)
+config.yaml
+
+# Build artifacts
+/gonka-proxy
+bin/
+dist/
+*.test
+coverage.out
+
+# Go tooling
+vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Local tooling & scratch
+.agents/
+.codex/
+.codegraph/
+.scratch/
