@@ -1,9 +1,10 @@
 services:
   gonka-proxy:
     build: .
+    container_name: gonka-proxy
     command: ["--config", "/etc/gonka-proxy/config.yaml"]
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:58081:8080"
     volumes:
       - ./config.yaml:/etc/gonka-proxy/config.yaml:ro
     restart: unless-stopped
