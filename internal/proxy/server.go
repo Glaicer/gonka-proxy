@@ -37,6 +37,7 @@ type Server struct {
 	cooldownVersion  uint64
 	logger           Logger
 	logLevel         config.LogLevel
+	reasoningEffort  *config.ReasoningEffort
 }
 
 type provider struct {
@@ -82,6 +83,13 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
+	// Normalize programmatic Config values (e.g. "MAX") to lower; Load already normalizes.
+	var normalizedEffort *config.ReasoningEffort
+	if cfg.ReasoningEffort != nil {
+		n := config.ReasoningEffort(strings.ToLower(strings.TrimSpace(string(*cfg.ReasoningEffort))))
+		normalizedEffort = &n
+	}
+
 	return &Server{
 		providers:        providers,
 		cooldownDuration: cfg.Cooldown,
@@ -89,8 +97,9 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
-		logger:   logger,
-		logLevel: cfg.LogLevel,
+		logger:         logger,
+		logLevel:       cfg.LogLevel,
+		reasoningEffort: normalizedEffort,
 	}, nil
 }
 
@@ -148,7 +157,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			}
 			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", selected.Name, selected.Priority)
 
-			upstreamBody, err := replaceVirtualModelWithAlias(payload, selected.ModelAlias)
+			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, s.reasoningEffort)
 			if err != nil {
 				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
 				return
@@ -474,8 +483,8 @@ func decodeRequestBody(body []byte) (map[string]json.RawMessage, error) {
 	return payload, nil
 }
 
-func replaceVirtualModelWithAlias(payload map[string]json.RawMessage, modelAlias string) ([]byte, error) {
-	forwardedPayload := make(map[string]json.RawMessage, len(payload)+1)
+func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias string, reasoningEffort *config.ReasoningEffort) ([]byte, error) {
+	forwardedPayload := make(map[string]json.RawMessage, len(payload)+2)
 	for key, value := range payload {
 		forwardedPayload[key] = value
 	}
@@ -484,6 +493,15 @@ func replaceVirtualModelWithAlias(payload map[string]json.RawMessage, modelAlias
 		return nil, fmt.Errorf("encode model alias: %w", err)
 	}
 	forwardedPayload["model"] = encodedModelAlias
+	if reasoningEffort != nil {
+		encodedEffort, err := json.Marshal(*reasoningEffort)
+		if err != nil {
+			return nil, fmt.Errorf("encode reasoning effort: %w", err)
+		}
+		forwardedPayload["reasoning_effort"] = encodedEffort
+	} else {
+		delete(forwardedPayload, "reasoning_effort")
+	}
 	return json.Marshal(forwardedPayload)
 }
 

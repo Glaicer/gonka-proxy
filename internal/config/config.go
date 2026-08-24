@@ -46,6 +46,43 @@ func (l LogLevel) Enabled(level LogLevel) bool {
 	return level.severity() >= l.severity()
 }
 
+// ReasoningEffort is the provider reasoning intensity. Nil means null/disabled.
+type ReasoningEffort string
+
+const (
+	ReasoningEffortLow  ReasoningEffort = "low"
+	ReasoningEffortHigh ReasoningEffort = "high"
+	ReasoningEffortMax  ReasoningEffort = "max"
+)
+
+const reasoningEffortErrorMsg = "reasoning_effort must be one of low, high, max, null"
+
+// IsValid reports whether the effort is one of the allowed non-null values.
+// Comparison is case-insensitive and trims surrounding whitespace so that
+// programmatic Config values like "MAX" or " Max " are accepted.
+func (r ReasoningEffort) IsValid() bool {
+	switch ReasoningEffort(strings.ToLower(strings.TrimSpace(string(r)))) {
+	case ReasoningEffortLow, ReasoningEffortHigh, ReasoningEffortMax:
+		return true
+	default:
+		return false
+	}
+}
+
+// parseReasoningEffort normalizes and validates a reasoning_effort string value.
+func parseReasoningEffort(s string) (*ReasoningEffort, error) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return nil, fmt.Errorf(reasoningEffortErrorMsg)
+	}
+	lowered := ReasoningEffort(strings.ToLower(trimmed))
+	if !lowered.IsValid() {
+		return nil, fmt.Errorf(reasoningEffortErrorMsg)
+	}
+	v := lowered
+	return &v, nil
+}
+
 // Config is the validated runtime configuration for the proxy.
 type Config struct {
 	ListenAddress         string
@@ -53,6 +90,7 @@ type Config struct {
 	RecoveryWait          time.Duration
 	ResponseHeaderTimeout time.Duration
 	LogLevel              LogLevel
+	ReasoningEffort       *ReasoningEffort
 	Providers             []Provider
 }
 
@@ -71,6 +109,7 @@ type rawConfig struct {
 	RecoveryWait          string        `yaml:"recovery_wait"`
 	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
 	LogLevel              string        `yaml:"log_level"`
+	ReasoningEffort       *string       `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
 	Providers             []rawProvider `yaml:"providers"`
 }
 
@@ -91,6 +130,30 @@ func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %q: %w", path, err)
+	}
+
+	// Inspect reasoning_effort presence and value before strict struct decoding,
+	// to distinguish absent vs explicit null (both decode as nil into *string).
+	var rawMap map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &rawMap); err != nil {
+		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+	}
+	node, ok := rawMap["reasoning_effort"]
+	if !ok {
+		return Config{}, fmt.Errorf("reasoning_effort is required")
+	}
+	var parsedReasoningEffort *ReasoningEffort
+	if node.Tag == "!!null" {
+		parsedReasoningEffort = nil
+	} else {
+		if node.Tag != "!!str" {
+			return Config{}, fmt.Errorf(reasoningEffortErrorMsg)
+		}
+		parsed, err := parseReasoningEffort(node.Value)
+		if err != nil {
+			return Config{}, err
+		}
+		parsedReasoningEffort = parsed
 	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
@@ -114,6 +177,7 @@ func Load(path string) (Config, error) {
 		RecoveryWait:          0,
 		ResponseHeaderTimeout: 0,
 		LogLevel:              LogLevelInfo,
+		ReasoningEffort:       parsedReasoningEffort,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 	}
 	if cfg.ListenAddress == "" {
@@ -162,6 +226,9 @@ func (c Config) Validate() error {
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("providers must contain at least one Provider")
+	}
+	if c.ReasoningEffort != nil && !c.ReasoningEffort.IsValid() {
+		return fmt.Errorf(reasoningEffortErrorMsg)
 	}
 
 	seen := make(map[providerIdentity]struct{}, len(c.Providers))

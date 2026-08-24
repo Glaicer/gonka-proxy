@@ -33,3 +33,7 @@ _Avoid_: Retry
 **Recovery Wait**:
 A configured delay entered when no providers remain available. When it ends, all cooldowns are cleared and a new Routing Pass begins; this repeats until success or client cancellation.
 _Avoid_: Retry limit, terminal failure
+
+**Reasoning Effort**:
+An OpenAI-compatible request field (`reasoning_effort`) that hints how much reasoning the upstream model should do. The proxy enforces a single globally configured value on every upstream request, overwriting any client-supplied value; when configured as `null` the field is stripped from the upstream payload.
+_Avoid_: reasoning level, thinking budget

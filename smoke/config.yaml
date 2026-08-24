@@ -4,6 +4,7 @@ server:
 cooldown: 1s
 recovery_wait: 1s
 response_header_timeout: 5s
+reasoning_effort: max
 
 providers:
   - name: fake-provider

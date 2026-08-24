@@ -44,6 +44,7 @@ func TestRunShutsDownActiveRoutingOnContextCancellation(t *testing.T) {
 cooldown: 1h
 recovery_wait: 1h
 response_header_timeout: 1h
+reasoning_effort: max
 providers:
   - name: primary
     base_url: %s/v1
