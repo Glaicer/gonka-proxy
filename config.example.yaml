@@ -19,8 +19,9 @@ log_level: WARN
 # Reasoning effort forwarded to every upstream request. Allowed values:
 # none, low, medium, high, xhigh, max, null.
 # Set to null (~) to disable forwarding and strip any client-supplied reasoning_effort.
-# This field is required — omitting it fails validation. Default when you want reasoning: max.
-reasoning_effort: max
+# This field is required — omitting it fails validation.
+# Default when you want reasoning: xhigh, because most providers don't support "max" yet. See README for details.
+reasoning_effort: xhigh
 
 # List of upstream LLM providers the proxy can route to. These are placeholders,
 # not real credentials. Each entry: name (unique id), base_url (API endpoint),
