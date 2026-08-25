@@ -1551,10 +1551,10 @@ func TestChatCompletionsStripsReasoningEffortWhenDisabled(t *testing.T) {
 
 func TestChatCompletionsOverwritesReasoningEffort(t *testing.T) {
 	tests := []struct {
-		name           string
-		configEffort   config.ReasoningEffort
-		clientBody     string
-		wantEffort     string
+		name         string
+		configEffort config.ReasoningEffort
+		clientBody   string
+		wantEffort   string
 	}{
 		{
 			name:         "low overwrites high",
@@ -1630,6 +1630,166 @@ func TestChatCompletionsOverwritesReasoningEffort(t *testing.T) {
 				t.Fatal("timed out waiting for upstream observation")
 			}
 		})
+	}
+}
+
+func TestChatCompletionsAppliesPerProviderReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name           string
+		globalEffort   *config.ReasoningEffort
+		providerEffort *config.ReasoningEffort
+		providerStrip  bool
+		clientBody     string
+		wantEffort     *string
+	}{
+		{
+			name:           "override wins over global",
+			globalEffort:   effortPtr(config.ReasoningEffortMax),
+			providerEffort: effortPtr(config.ReasoningEffortHigh),
+			clientBody:     `{"model":"virtual-model","reasoning_effort":"low","messages":[]}`,
+			wantEffort:     stringPtr("high"),
+		},
+		{
+			name:          "strip overrides global even when client supplies one",
+			globalEffort:  effortPtr(config.ReasoningEffortMax),
+			providerStrip: true,
+			clientBody:    `{"model":"virtual-model","reasoning_effort":"low","messages":[]}`,
+			wantEffort:    nil,
+		},
+		{
+			name:         "absent inherits global",
+			globalEffort: effortPtr(config.ReasoningEffortMax),
+			clientBody:   `{"model":"virtual-model","reasoning_effort":"low","messages":[]}`,
+			wantEffort:   stringPtr("max"),
+		},
+		{
+			name:          "strip with null global stays stripped",
+			globalEffort:  nil,
+			providerStrip: true,
+			clientBody:    `{"model":"virtual-model","reasoning_effort":"low","messages":[]}`,
+			wantEffort:    nil,
+		},
+		{
+			name:           "override normalizes case",
+			globalEffort:   nil,
+			providerEffort: effortPtr(config.ReasoningEffort("HIGH")),
+			clientBody:     `{"model":"virtual-model","messages":[]}`,
+			wantEffort:     stringPtr("high"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := make(chan upstreamObservation, 1)
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read upstream body: %v", err)
+					return
+				}
+				observation <- upstreamObservation{body: body}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}))
+			defer provider.Close()
+
+			handler, err := proxy.NewWithLogger(config.Config{
+				ListenAddress:         "127.0.0.1:8080",
+				Cooldown:              time.Second,
+				RecoveryWait:          time.Second,
+				ResponseHeaderTimeout: time.Second,
+				ReasoningEffort:       tc.globalEffort,
+				Providers: []config.Provider{
+					{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 10, ReasoningEffort: tc.providerEffort, StripReasoningEffort: tc.providerStrip},
+				},
+			}, log.New(io.Discard, "", 0))
+			if err != nil {
+				t.Fatalf("create proxy: %v", err)
+			}
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(tc.clientBody))
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			_, _ = io.ReadAll(resp.Body)
+
+			select {
+			case obs := <-observation:
+				assertRequestBody(t, obs.body, tc.clientBody, "provider-model", tc.wantEffort)
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for upstream observation")
+			}
+		})
+	}
+}
+
+func TestChatCompletionsFailoverUsesEachProvidersReasoningEffort(t *testing.T) {
+	observations := make(map[string]chan upstreamObservation, 2)
+	observations["primary"] = make(chan upstreamObservation, 1)
+	observations["backup"] = make(chan upstreamObservation, 1)
+
+	newObservedProvider := func(name string, statusCode int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read upstream body: %v", err)
+				return
+			}
+			observations[name] <- upstreamObservation{body: body}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}))
+	}
+	failing := newObservedProvider("primary", http.StatusInternalServerError)
+	defer failing.Close()
+	healthy := newObservedProvider("backup", http.StatusOK)
+	defer healthy.Close()
+
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       effortPtr(config.ReasoningEffortLow),
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: failing.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100, StripReasoningEffort: true},
+			{Name: "backup", BaseURL: healthy.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50, ReasoningEffort: effortPtr(config.ReasoningEffortHigh)},
+		},
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requestBody := `{"model":"virtual-model","reasoning_effort":"low","messages":[{"role":"user","content":"hello"}]}`
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	_, _ = io.ReadAll(resp.Body)
+
+	select {
+	case obs := <-observations["primary"]:
+		assertRequestBody(t, obs.body, requestBody, "primary-model", nil)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for primary upstream observation")
+	}
+	select {
+	case obs := <-observations["backup"]:
+		assertRequestBody(t, obs.body, requestBody, "backup-model", stringPtr("high"))
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backup upstream observation")
 	}
 }
 
@@ -1742,3 +1902,5 @@ func assertRequestBody(t *testing.T, gotBody []byte, wantBody string, wantModelA
 }
 
 func stringPtr(s string) *string { return &s }
+
+func effortPtr(e config.ReasoningEffort) *config.ReasoningEffort { return &e }

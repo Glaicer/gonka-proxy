@@ -35,5 +35,5 @@ A configured delay entered when no providers remain available. When it ends, all
 _Avoid_: Retry limit, terminal failure
 
 **Reasoning Effort**:
-An OpenAI-compatible request field (`reasoning_effort`) that hints how much reasoning the upstream model should do. The proxy enforces a single globally configured value on every upstream request, overwriting any client-supplied value; when configured as `null` the field is stripped from the upstream payload.
+An OpenAI-compatible request field (`reasoning_effort`) that hints how much reasoning the upstream model should do. The proxy enforces a globally configured value on every upstream request, overwriting any client-supplied value; when configured as `null` the field is stripped from the upstream payload. A provider may override the global value with its own effort, or strip the field entirely with an explicit null, for providers that reject the parameter.
 _Avoid_: reasoning level, thinking budget

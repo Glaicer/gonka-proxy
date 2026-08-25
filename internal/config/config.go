@@ -69,18 +69,29 @@ func (r ReasoningEffort) IsValid() bool {
 	}
 }
 
+// Normalize lowercases and trims the effort so programmatic Config values
+// like "MAX" behave like loaded YAML values.
+func (r ReasoningEffort) Normalize() ReasoningEffort {
+	return ReasoningEffort(strings.ToLower(strings.TrimSpace(string(r))))
+}
+
 // parseReasoningEffort normalizes and validates a reasoning_effort string value.
 func parseReasoningEffort(s string) (*ReasoningEffort, error) {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		return nil, fmt.Errorf(reasoningEffortErrorMsg)
 	}
-	lowered := ReasoningEffort(strings.ToLower(trimmed))
+	lowered := ReasoningEffort(trimmed).Normalize()
 	if !lowered.IsValid() {
 		return nil, fmt.Errorf(reasoningEffortErrorMsg)
 	}
 	v := lowered
 	return &v, nil
+}
+
+// providerReasoningEffortError scopes the shared enum message to one provider.
+func providerReasoningEffortError(index int) error {
+	return fmt.Errorf("providers[%d].%s", index, reasoningEffortErrorMsg)
 }
 
 // Config is the validated runtime configuration for the proxy.
@@ -95,12 +106,17 @@ type Config struct {
 }
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
+// A provider-level reasoning_effort overrides the global value; an explicit
+// null strips the field for this provider. Leave both zero to inherit global.
 type Provider struct {
 	Name       string
 	BaseURL    string
 	APIKey     string
 	ModelAlias string
 	Priority   int
+
+	ReasoningEffort      *ReasoningEffort
+	StripReasoningEffort bool
 }
 
 type rawConfig struct {
@@ -123,6 +139,9 @@ type rawProvider struct {
 	APIKey     string `yaml:"api_key"`
 	ModelAlias string `yaml:"model_alias"`
 	Priority   *int   `yaml:"priority"`
+	// ReasoningEffort keeps the raw node to distinguish absent (inherit
+	// global, zero Node) from explicit null (strip for this provider).
+	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
 }
 
 // Load reads, defaults, normalizes, and validates one YAML configuration file.
@@ -245,6 +264,12 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(provider.ModelAlias) == "" {
 			return fmt.Errorf("providers[%d].model_alias must not be empty", index)
 		}
+		if provider.ReasoningEffort != nil && !provider.ReasoningEffort.IsValid() {
+			return providerReasoningEffortError(index)
+		}
+		if provider.StripReasoningEffort && provider.ReasoningEffort != nil {
+			return fmt.Errorf("providers[%d].reasoning_effort must be either null or an effort value", index)
+		}
 		if _, err := parseProviderBaseURL(index, provider.BaseURL); err != nil {
 			return err
 		}
@@ -312,12 +337,32 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	parsed.RawPath = ""
 	normalizedURL := strings.TrimRight(parsed.String(), "/")
 
+	var effortOverride *ReasoningEffort
+	var stripEffort bool
+	if node := raw.ReasoningEffort; !node.IsZero() {
+		switch node.Tag {
+		case "!!null":
+			stripEffort = true
+		case "!!str":
+			override, err := parseReasoningEffort(node.Value)
+			if err != nil {
+				return Provider{}, providerReasoningEffortError(index)
+			}
+			effortOverride = override
+		default:
+			return Provider{}, providerReasoningEffortError(index)
+		}
+	}
+
 	provider := Provider{
 		Name:       strings.TrimSpace(raw.Name),
 		BaseURL:    normalizedURL,
 		APIKey:     strings.TrimSpace(raw.APIKey),
 		ModelAlias: strings.TrimSpace(raw.ModelAlias),
 		Priority:   *raw.Priority,
+
+		ReasoningEffort:      effortOverride,
+		StripReasoningEffort: stripEffort,
 	}
 	return provider, nil
 }

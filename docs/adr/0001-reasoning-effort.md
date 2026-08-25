@@ -1,6 +1,6 @@
 # ADR 0001: Global Reasoning Effort Enforcement
 
-**Status:** Accepted
+**Status:** Accepted (global-only clause superseded by [ADR 0002](0002-per-provider-reasoning-effort.md))
 **Date:** 2026-08-24
 
 ## Context

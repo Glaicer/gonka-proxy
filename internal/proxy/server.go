@@ -37,7 +37,6 @@ type Server struct {
 	cooldownVersion  uint64
 	logger           Logger
 	logLevel         config.LogLevel
-	reasoningEffort  *config.ReasoningEffort
 }
 
 type provider struct {
@@ -45,6 +44,10 @@ type provider struct {
 	chatURL         string
 	cooldownUntil   time.Time
 	cooldownVersion uint64
+
+	// reasoningEffort is the effective effort for this provider: the provider
+	// override, or the global value when unset. Nil strips the field.
+	reasoningEffort *config.ReasoningEffort
 }
 
 // New creates a proxy handler from validated configuration.
@@ -61,6 +64,9 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		logger = log.Default()
 	}
 
+	// Normalize programmatic Config values (e.g. "MAX") to lower; Load already normalizes.
+	normalizedEffort := normalizeReasoningEffort(cfg.ReasoningEffort)
+
 	providers := make([]*provider, 0, len(cfg.Providers))
 	for _, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
@@ -68,8 +74,9 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
 		providers = append(providers, &provider{
-			Provider: configuredProvider,
-			chatURL:  chatURL,
+			Provider:        configuredProvider,
+			chatURL:         chatURL,
+			reasoningEffort: resolveReasoningEffort(normalizedEffort, configuredProvider),
 		})
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
@@ -83,13 +90,6 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
-	// Normalize programmatic Config values (e.g. "MAX") to lower; Load already normalizes.
-	var normalizedEffort *config.ReasoningEffort
-	if cfg.ReasoningEffort != nil {
-		n := config.ReasoningEffort(strings.ToLower(strings.TrimSpace(string(*cfg.ReasoningEffort))))
-		normalizedEffort = &n
-	}
-
 	return &Server{
 		providers:        providers,
 		cooldownDuration: cfg.Cooldown,
@@ -97,10 +97,31 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
-		logger:         logger,
-		logLevel:       cfg.LogLevel,
-		reasoningEffort: normalizedEffort,
+		logger:   logger,
+		logLevel: cfg.LogLevel,
 	}, nil
+}
+
+// normalizeReasoningEffort normalizes an effort pointer so programmatic
+// Config values like "MAX" behave like loaded YAML values.
+func normalizeReasoningEffort(effort *config.ReasoningEffort) *config.ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	n := effort.Normalize()
+	return &n
+}
+
+// resolveReasoningEffort picks the effective effort for a provider: an
+// explicit strip wins, then the provider override, then the global value.
+func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *config.ReasoningEffort {
+	if p.StripReasoningEffort {
+		return nil
+	}
+	if override := normalizeReasoningEffort(p.ReasoningEffort); override != nil {
+		return override
+	}
+	return global
 }
 
 // ServeHTTP handles the single MVP endpoint.
@@ -157,7 +178,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			}
 			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", selected.Name, selected.Priority)
 
-			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, s.reasoningEffort)
+			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
 			if err != nil {
 				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
 				return

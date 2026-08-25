@@ -25,6 +25,10 @@ reasoning_effort: max
 # not real credentials. Each entry: name (unique id), base_url (API endpoint),
 # api_key (auth), model_alias (model name to match requests against), priority
 # (lower = preferred). Copy a block to add another provider.
+#
+# Optional per-provider reasoning_effort overrides the global value for that
+# provider: low, high, or max sets a different value; null (~) strips the field
+# entirely (for providers that reject the parameter); omit it to inherit global.
 providers:
   - name: primary
     base_url: https://provider.example/v1
@@ -36,3 +40,4 @@ providers:
     api_key: replace-with-provider-key
     model_alias: backup-model-name
     priority: 50
+    reasoning_effort: ~

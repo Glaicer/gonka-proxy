@@ -231,10 +231,10 @@ providers:
 
 func TestLoadReasoningEffort(t *testing.T) {
 	tests := []struct {
-		name    string
+		name     string
 		contents string
-		want    *string // nil means expect disabled (nil), non-nil is normalized value
-		wantErr string
+		want     *string // nil means expect disabled (nil), non-nil is normalized value
+		wantErr  string
 	}{
 		{
 			name:     "absent",
@@ -342,6 +342,161 @@ func TestLoadReasoningEffort(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLoadProviderReasoningEffort(t *testing.T) {
+	providerTemplate := func(effortLine string) string {
+		return "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n" + effortLine
+	}
+	tests := []struct {
+		name       string
+		effortLine string
+		want       *string // nil + !wantStrip means inherit (nil override)
+		wantStrip  bool
+		wantErr    string
+	}{
+		{
+			name:       "absent inherits global",
+			effortLine: "",
+			want:       nil,
+		},
+		{
+			name:       "null strips for this provider",
+			effortLine: "    reasoning_effort: null\n",
+			wantStrip:  true,
+		},
+		{
+			name:       "tilde strips for this provider",
+			effortLine: "    reasoning_effort: ~\n",
+			wantStrip:  true,
+		},
+		{
+			name:       "bare null strips",
+			effortLine: "    reasoning_effort:\n",
+			wantStrip:  true,
+		},
+		{
+			name:       "value overrides global",
+			effortLine: "    reasoning_effort: high\n",
+			want:       stringPtr("high"),
+		},
+		{
+			name:       "uppercase normalized",
+			effortLine: "    reasoning_effort: HIGH\n",
+			want:       stringPtr("high"),
+		},
+		{
+			name:       "trimmed value normalized",
+			effortLine: "    reasoning_effort: \" low \"\n",
+			want:       stringPtr("low"),
+		},
+		{
+			name:       "quoted null is an error",
+			effortLine: "    reasoning_effort: \"null\"\n",
+			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+		},
+		{
+			name:       "quoted empty is an error",
+			effortLine: "    reasoning_effort: \"\"\n",
+			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+		},
+		{
+			name:       "medium is an error",
+			effortLine: "    reasoning_effort: medium\n",
+			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+		},
+		{
+			name:       "numeric is an error",
+			effortLine: "    reasoning_effort: 123\n",
+			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(providerTemplate(test.effortLine)), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := config.Load(configPath)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want error containing %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %q, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(cfg.Providers) != 1 {
+				t.Fatalf("providers = %d, want 1", len(cfg.Providers))
+			}
+			provider := cfg.Providers[0]
+			if provider.StripReasoningEffort != test.wantStrip {
+				t.Fatalf("StripReasoningEffort = %v, want %v", provider.StripReasoningEffort, test.wantStrip)
+			}
+			if test.want == nil {
+				if provider.ReasoningEffort != nil {
+					t.Fatalf("ReasoningEffort = %q, want nil (inherit)", *provider.ReasoningEffort)
+				}
+				return
+			}
+			if provider.ReasoningEffort == nil {
+				t.Fatalf("ReasoningEffort = nil, want %q", *test.want)
+			}
+			if string(*provider.ReasoningEffort) != *test.want {
+				t.Errorf("ReasoningEffort = %q, want %q", *provider.ReasoningEffort, *test.want)
+			}
+		})
+	}
+}
+
+func TestLoadProviderReasoningEffortErrorIndex(t *testing.T) {
+	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n  - name: backup\n    base_url: https://backup.example/v1\n    api_key: backup-secret\n    model_alias: backup-model\n    priority: 5\n    reasoning_effort: medium\n"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := config.Load(configPath)
+	if err == nil {
+		t.Fatal("Load succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "providers[1].reasoning_effort must be one of low, high, max, null") {
+		t.Fatalf("error = %q, want providers[1] message", err)
+	}
+}
+
+func TestValidateRejectsConflictingProviderReasoningEffort(t *testing.T) {
+	effort := config.ReasoningEffortHigh
+	cfg := config.Config{
+		ListenAddress:         config.DefaultListenAddress,
+		Cooldown:              config.DefaultCooldown,
+		RecoveryWait:          config.DefaultRecoveryWait,
+		ResponseHeaderTimeout: config.DefaultResponseHeaderTimeout,
+		ReasoningEffort:       nil,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 10, ReasoningEffort: &effort, StripReasoningEffort: true},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate with both ReasoningEffort and StripReasoningEffort should fail")
+	}
+	if !strings.Contains(err.Error(), "providers[0]") {
+		t.Fatalf("error = %q, want providers[0] prefix", err)
+	}
+
+	invalidEffort := config.ReasoningEffort("medium")
+	cfg.Providers[0] = config.Provider{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 10, ReasoningEffort: &invalidEffort}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate with invalid provider ReasoningEffort should fail")
+	}
+	if !strings.Contains(err.Error(), "providers[0].reasoning_effort must be one of low, high, max, null") {
+		t.Fatalf("error = %q, want enum message", err)
 	}
 }
 
