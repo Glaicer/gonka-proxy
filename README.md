@@ -72,6 +72,23 @@ providers:
 
 The same rules apply after failover: each provider always gets its own resolved setting.
 
+### Provider support
+
+> ***The data is current as of 2026-08-25. If you would like to add new data or update existing information, please open an issue and I will make the changes.***
+
+Values each provider currently accepts for DeepSeek V4 Flash 0731 model:
+
+
+| Provider       | low | medium | high | xhigh | max         |
+| -------------- | --- | ------ | ---- | ----- | ----------- |
+| proxy.gonka.gg | OK  | OK     | OK   | OK    | OK          |
+| GonkaRouter    | OK  | OK     | OK   | OK    | unsupported |
+| GonkaGate      | OK  | OK     | OK   | OK    | unsupported |
+| Gonka-API      | OK  | OK     | OK   | OK    | unsupported |
+
+
+An unsupported value makes the provider answer with **HTTP 400**, which is passed back to your app unchanged — it does **not** fail over. Point those providers at a value they accept (or `~` to strip the field) with a per-provider `reasoning_effort`.
+
 ## Launch
 
 **Docker (recommended):**
