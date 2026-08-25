@@ -50,19 +50,23 @@ func (l LogLevel) Enabled(level LogLevel) bool {
 type ReasoningEffort string
 
 const (
-	ReasoningEffortLow  ReasoningEffort = "low"
-	ReasoningEffortHigh ReasoningEffort = "high"
-	ReasoningEffortMax  ReasoningEffort = "max"
+	ReasoningEffortNone   ReasoningEffort = "none"
+	ReasoningEffortLow    ReasoningEffort = "low"
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	ReasoningEffortHigh   ReasoningEffort = "high"
+	ReasoningEffortXHigh  ReasoningEffort = "xhigh"
+	ReasoningEffortMax    ReasoningEffort = "max"
 )
 
-const reasoningEffortErrorMsg = "reasoning_effort must be one of low, high, max, null"
+const reasoningEffortErrorMsg = "reasoning_effort must be one of none, low, medium, high, xhigh, max, null"
 
 // IsValid reports whether the effort is one of the allowed non-null values.
 // Comparison is case-insensitive and trims surrounding whitespace so that
 // programmatic Config values like "MAX" or " Max " are accepted.
 func (r ReasoningEffort) IsValid() bool {
-	switch ReasoningEffort(strings.ToLower(strings.TrimSpace(string(r)))) {
-	case ReasoningEffortLow, ReasoningEffortHigh, ReasoningEffortMax:
+	switch r.Normalize() {
+	case ReasoningEffortNone, ReasoningEffortLow, ReasoningEffortMedium,
+		ReasoningEffortHigh, ReasoningEffortXHigh, ReasoningEffortMax:
 		return true
 	default:
 		return false

@@ -16,7 +16,8 @@ response_header_timeout: 30s
 # Minimum log level to emit (INFO, WARN, or ERROR).
 log_level: WARN
 
-# Reasoning effort forwarded to every upstream request. Allowed values: low, high, max, null.
+# Reasoning effort forwarded to every upstream request. Allowed values:
+# none, low, medium, high, xhigh, max, null.
 # Set to null (~) to disable forwarding and strip any client-supplied reasoning_effort.
 # This field is required — omitting it fails validation. Default when you want reasoning: max.
 reasoning_effort: max
@@ -27,8 +28,8 @@ reasoning_effort: max
 # (lower = preferred). Copy a block to add another provider.
 #
 # Optional per-provider reasoning_effort overrides the global value for that
-# provider: low, high, or max sets a different value; null (~) strips the field
-# entirely (for providers that reject the parameter); omit it to inherit global.
+# provider with any allowed value; null (~) strips the field entirely (for
+# providers that reject the parameter); omit it to inherit global.
 providers:
   - name: primary
     base_url: https://provider.example/v1

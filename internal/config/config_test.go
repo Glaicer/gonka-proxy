@@ -259,22 +259,22 @@ func TestLoadReasoningEffort(t *testing.T) {
 		{
 			name:     "quoted empty",
 			contents: "reasoning_effort: \"\"\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:     "quoted empty single",
 			contents: "reasoning_effort: ''\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:     "quoted null strict",
 			contents: "reasoning_effort: \"null\"\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:     "quoted NULL strict",
 			contents: "reasoning_effort: 'NULL'\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:     "trimmed max",
@@ -297,14 +297,39 @@ func TestLoadReasoningEffort(t *testing.T) {
 			want:     stringPtr("high"),
 		},
 		{
-			name:     "medium invalid",
+			name:     "none forwarded",
+			contents: "reasoning_effort: none\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
+			want:     stringPtr("none"),
+		},
+		{
+			name:     "NONE uppercase",
+			contents: "reasoning_effort: NONE\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
+			want:     stringPtr("none"),
+		},
+		{
+			name:     "medium accepted",
 			contents: "reasoning_effort: medium\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			want:     stringPtr("medium"),
+		},
+		{
+			name:     "xhigh accepted",
+			contents: "reasoning_effort: xhigh\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
+			want:     stringPtr("xhigh"),
+		},
+		{
+			name:     "XHIGH trimmed and normalized",
+			contents: "reasoning_effort: \" XHigh \"\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
+			want:     stringPtr("xhigh"),
+		},
+		{
+			name:     "minimal invalid",
+			contents: "reasoning_effort: minimal\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:     "numeric invalid",
 			contents: "reasoning_effort: 123\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n",
-			wantErr:  "reasoning_effort must be one of low, high, max, null",
+			wantErr:  "reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 	}
 	for _, test := range tests {
@@ -392,24 +417,39 @@ func TestLoadProviderReasoningEffort(t *testing.T) {
 			want:       stringPtr("low"),
 		},
 		{
+			name:       "none forwarded",
+			effortLine: "    reasoning_effort: none\n",
+			want:       stringPtr("none"),
+		},
+		{
+			name:       "medium accepted",
+			effortLine: "    reasoning_effort: Medium\n",
+			want:       stringPtr("medium"),
+		},
+		{
+			name:       "xhigh accepted",
+			effortLine: "    reasoning_effort: \" XHIGH \"\n",
+			want:       stringPtr("xhigh"),
+		},
+		{
 			name:       "quoted null is an error",
 			effortLine: "    reasoning_effort: \"null\"\n",
-			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+			wantErr:    "providers[0].reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:       "quoted empty is an error",
 			effortLine: "    reasoning_effort: \"\"\n",
-			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+			wantErr:    "providers[0].reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
-			name:       "medium is an error",
-			effortLine: "    reasoning_effort: medium\n",
-			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+			name:       "minimal is an error",
+			effortLine: "    reasoning_effort: minimal\n",
+			wantErr:    "providers[0].reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 		{
 			name:       "numeric is an error",
 			effortLine: "    reasoning_effort: 123\n",
-			wantErr:    "providers[0].reasoning_effort must be one of low, high, max, null",
+			wantErr:    "providers[0].reasoning_effort must be one of none, low, medium, high, xhigh, max, null",
 		},
 	}
 	for _, test := range tests {
@@ -455,7 +495,7 @@ func TestLoadProviderReasoningEffort(t *testing.T) {
 }
 
 func TestLoadProviderReasoningEffortErrorIndex(t *testing.T) {
-	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n  - name: backup\n    base_url: https://backup.example/v1\n    api_key: backup-secret\n    model_alias: backup-model\n    priority: 5\n    reasoning_effort: medium\n"
+	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n  - name: backup\n    base_url: https://backup.example/v1\n    api_key: backup-secret\n    model_alias: backup-model\n    priority: 5\n    reasoning_effort: extreme\n"
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -464,7 +504,7 @@ func TestLoadProviderReasoningEffortErrorIndex(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load succeeded, want error")
 	}
-	if !strings.Contains(err.Error(), "providers[1].reasoning_effort must be one of low, high, max, null") {
+	if !strings.Contains(err.Error(), "providers[1].reasoning_effort must be one of none, low, medium, high, xhigh, max, null") {
 		t.Fatalf("error = %q, want providers[1] message", err)
 	}
 }
@@ -489,13 +529,13 @@ func TestValidateRejectsConflictingProviderReasoningEffort(t *testing.T) {
 		t.Fatalf("error = %q, want providers[0] prefix", err)
 	}
 
-	invalidEffort := config.ReasoningEffort("medium")
+	invalidEffort := config.ReasoningEffort("extreme")
 	cfg.Providers[0] = config.Provider{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 10, ReasoningEffort: &invalidEffort}
 	err = cfg.Validate()
 	if err == nil {
 		t.Fatal("Validate with invalid provider ReasoningEffort should fail")
 	}
-	if !strings.Contains(err.Error(), "providers[0].reasoning_effort must be one of low, high, max, null") {
+	if !strings.Contains(err.Error(), "providers[0].reasoning_effort must be one of none, low, medium, high, xhigh, max, null") {
 		t.Fatalf("error = %q, want enum message", err)
 	}
 }
@@ -515,10 +555,10 @@ func TestValidateReasoningEffortCaseInsensitive(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate with uppercase MAX should pass, got %v", err)
 	}
-	invalid := config.ReasoningEffort("medium")
+	invalid := config.ReasoningEffort("extreme")
 	cfg.ReasoningEffort = &invalid
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("Validate with medium should fail")
+		t.Fatal("Validate with extreme should fail")
 	} else if !strings.Contains(err.Error(), "null") {
 		t.Fatalf("error = %q, want to contain null", err)
 	}

@@ -1580,6 +1580,24 @@ func TestChatCompletionsOverwritesReasoningEffort(t *testing.T) {
 			clientBody:   `{"model":"virtual-model","messages":[{"role":"user","content":"hi"}],"temperature":0.7}`,
 			wantEffort:   "low",
 		},
+		{
+			name:         "none forwards when absent",
+			configEffort: config.ReasoningEffortNone,
+			clientBody:   `{"model":"virtual-model","messages":[]}`,
+			wantEffort:   "none",
+		},
+		{
+			name:         "medium overwrites client high",
+			configEffort: config.ReasoningEffortMedium,
+			clientBody:   `{"model":"virtual-model","reasoning_effort":"high","messages":[]}`,
+			wantEffort:   "medium",
+		},
+		{
+			name:         "xhigh overwrites client low",
+			configEffort: config.ReasoningEffortXHigh,
+			clientBody:   `{"model":"virtual-model","reasoning_effort":"low","messages":[]}`,
+			wantEffort:   "xhigh",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
