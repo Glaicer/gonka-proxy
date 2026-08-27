@@ -83,11 +83,19 @@ Values each provider currently accepts for DeepSeek V4 Flash 0731 model:
 | -------------- | --- | ------ | ---- | ----- | ----------- |
 | proxy.gonka.gg | OK  | OK     | OK   | OK    | OK          |
 | GonkaRouter    | OK  | OK     | OK   | OK    | unsupported |
-| GonkaGate      | OK  | OK     | OK   | OK    | unsupported |
+| GonkaGate      | OK  | OK     | OK   | OK    | OK |
 | Gonka-API      | OK  | OK     | OK   | OK    | unsupported |
 
 
 An unsupported value makes the provider answer with **HTTP 400**, which is passed back to your app unchanged — it does **not** fail over. Point those providers at a value they accept (or `~` to strip the field) with a per-provider `reasoning_effort`.
+
+To check provider support against your own configuration, run:
+
+```sh
+./check-reasoning-effort.sh
+```
+
+The script tests every configured provider with all five values, shows progress and an aligned results table.
 
 ## Launch
 
