@@ -561,7 +561,8 @@ func (s *Server) payloadLoggingEnabled() bool {
 
 func (s *Server) logProviderResponse(selected *provider, statusCode int, errorMessage string) {
 	if statusCode == http.StatusOK && errorMessage == "" {
-		s.logAt(config.LogLevelInfo, "%s status=%d", s.redactProviderSecrets(selected.Name), statusCode)
+		// Successful response status is mandatory operational output at every log level.
+		s.logger.Printf("%s status=%d", s.redactProviderSecrets(selected.Name), statusCode)
 		return
 	}
 	if statusCode > 0 {

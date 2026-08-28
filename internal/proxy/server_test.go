@@ -86,6 +86,36 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsAlwaysLogsSuccessfulStatus(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	server, logs := newLoggedProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	}, "")
+	defer server.Close()
+
+	response, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_ = response.Body.Close()
+
+	if output := logs.String(); !strings.Contains(output, "provider-0 status=200") {
+		t.Fatalf("logs = %q, want successful status log", output)
+	}
+}
+
 func TestChatCompletionsPayloadLogsOnlyAtInfo(t *testing.T) {
 	for _, logLevel := range []config.LogLevel{
 		config.LogLevelInfo,
@@ -141,8 +171,8 @@ func TestChatCompletionsPayloadLogsOnlyAtInfo(t *testing.T) {
 					}
 				}
 				successLogged := strings.Contains(output, "provider-1 status=200")
-				if successLogged != wantPayload {
-					t.Fatalf("success status log present = %t, want %t at %s", successLogged, wantPayload, logLevel)
+				if !successLogged {
+					t.Fatalf("success status log present = %t, want true at %s", successLogged, logLevel)
 				}
 			})
 
