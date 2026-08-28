@@ -43,13 +43,13 @@ The service runs in Docker, is exposed only on the host loopback interface, requ
 25. As an operator, I want Client Errors not to trigger failover or Cooldown, so that invalid requests and credentials are not misdiagnosed as Provider instability.
 26. As an OpenCode user, I want successful response status, headers, body, and stream semantics preserved, so that the proxy remains transparent to OpenCode.
 27. As an OpenCode user, I want an interrupted stream not to be mixed with a second Provider's generation, so that I never receive a corrupt combined response.
-28. As an operator, I want a configurable response-header timeout with a 60-second default, so that slow startup and streaming duration are controlled separately.
+28. As an operator, I want a configurable response-header timeout with a 30-second default, so that slow startup and streaming duration are controlled separately.
 29. As an operator, I want Cooldown state shared across concurrent requests, so that a failure discovered by one request protects all subsequent requests.
 30. As an operator, I want the proxy to load a mounted YAML file at startup, so that Providers and timing values can be changed without rebuilding the image.
 31. As an operator, I want invalid or empty Provider configuration to fail startup with a clear error, so that the service never runs in a nonfunctional state.
 32. As an operator, I want configuration changes to take effect after container restart, so that the MVP has predictable configuration lifecycle semantics.
-33. As an operator, I want concise logs of routing attempts, response classes, Cooldowns, and Recovery Waits, so that I can diagnose Provider health.
-34. As an operator, I want logs to exclude request bodies and API keys, so that prompts and credentials are not leaked.
+33. As an operator, I want concise logs with detailed lifecycle diagnostics at `INFO` (Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation), while `WARN` retains Failover Failure and stream-abort events, so that I can diagnose Provider health at the appropriate verbosity.
+34. As an operator, I want logs to exclude prompts, request bodies, authorization headers, and API keys, while allowing bounded provider error messages and stream tails only on errors at `INFO`, so that diagnostics are useful without leaking routine traffic or credentials. Those response-derived fields are suppressed at `WARN` and `ERROR`.
 35. As an operator, I want a small single-service Docker image, so that the proxy has low memory, CPU, storage, and operational overhead.
 36. As an operator, I want the container to listen on its internal interface while Docker publishes it only to `127.0.0.1`, so that OpenCode can reach it without exposing it to the network.
 37. As an operator, I want HTTPS Provider endpoints to work using normal public certificate authorities, so that no extra TLS setup is required for Gonka providers.
@@ -69,12 +69,12 @@ The service runs in Docker, is exposed only on the host loopback interface, requ
 - When no Provider is available, wait for the configured Recovery Wait, clear every Provider's Cooldown, and start a new Routing Pass. Repeat until success or downstream cancellation; do not return a terminal exhaustion error.
 - Propagate downstream request cancellation through active upstream attempts and Recovery Waits.
 - Use a YAML configuration containing server listen address, Cooldown duration, Recovery Wait duration, response-header timeout, and an ordered Provider list. Each Provider requires `base_url`, `api_key`, `model_alias`, and `priority`.
-- Default Cooldown to 120 seconds, Recovery Wait to 30 seconds, response-header timeout to 60 seconds, and the container listen address to `0.0.0.0:8080`.
+- Default Cooldown to 120 seconds, Recovery Wait to 30 seconds, response-header timeout to 30 seconds, log level to `WARN`, and the container listen address to `0.0.0.0:8080`.
 - Interpret a Provider base URL as its OpenAI API root, normally ending in `/v1`, and append the chat-completions route without duplicating path segments.
 - Ignore missing or arbitrary downstream authorization credentials. Replace any downstream authorization header with the selected Provider's bearer credential upstream.
 - Load and validate configuration only at process startup. Reject malformed durations, missing required Provider fields, duplicate or unusable Provider definitions, and an empty Provider list.
-- Use connection pooling and stream response bodies instead of buffering successful completions. Do not log request bodies, response bodies, authorization headers, or API keys.
-- Log Provider selection, Failover Failure category, status code when present, Cooldown transitions, Recovery Wait transitions, and cancellation at a concise operational level.
+- Use connection pooling and stream response bodies instead of buffering successful completions. Detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—are `INFO`-only and therefore suppressed at `WARN` and `ERROR`. At `INFO`, error diagnostics may include only bounded provider error messages and bounded stream tails, and only for the error that produced them; these response-derived fields are also suppressed at `WARN` and `ERROR`. Never log prompts, request bodies, authorization headers, or API keys.
+- Log Failover Failure categories, status codes when present, and stream-abort events at `WARN`; `ERROR` is the strictest threshold and emits only ERROR-level events.
 - Build a minimal production container that includes trusted CA certificates and the compiled Go binary. Provide a Docker run/Compose example that binds host `127.0.0.1` to the container port and mounts the YAML configuration read-only.
 - Include an OpenCode configuration example using a local base URL ending in `/v1`, `@ai-sdk/openai-compatible`, one Virtual Model, and either no API key or an arbitrary placeholder key.
 
@@ -108,7 +108,7 @@ The service runs in Docker, is exposed only on the host loopback interface, requ
 - Multiple proxy replicas coordinating Provider state.
 - Retrying or merging a response after streaming has started.
 - Request/response transformation beyond replacing the top-level model and upstream authorization.
-- Prompt logging, response logging, metrics backends, tracing systems, dashboards, or alerting integrations.
+- General prompt logging and unbounded response logging remain out of scope; the bounded, error-only `INFO` diagnostics described above are the sole response-content exception. Metrics backends, tracing systems, dashboards, and alerting integrations are also out of scope.
 - Custom Provider TLS certificates, mutual TLS, HTTP proxies, or Provider-specific protocols.
 - Hot-reloadable secrets, external secret managers, or environment-variable interpolation in the YAML file.
 - Formal protection for unusually large request bodies or other nonstandard OpenAI-compatible behavior in the MVP.
@@ -116,5 +116,5 @@ The service runs in Docker, is exposed only on the host loopback interface, requ
 ## Further Notes
 
 - Gonka Proxy is intentionally optimized for unattended continuity rather than fast terminal failure. During a total Provider outage, a request remains open and continues Recovery Wait cycles until OpenCode cancels it.
-- Docker loopback exposure is achieved by host port publishing such as `127.0.0.1:8080:8080`; binding only to `127.0.0.1` inside the container would prevent normal host port forwarding.
+- Docker loopback exposure is achieved by host port publishing such as `127.0.0.1:58081:8080`; binding only to `127.0.0.1` inside the container would prevent normal host port forwarding.
 - The OpenCode provider must use `@ai-sdk/openai-compatible`; current OpenCode documentation identifies this package with the `/v1/chat/completions` contract.

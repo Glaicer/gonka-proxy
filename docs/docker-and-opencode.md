@@ -12,6 +12,8 @@ Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root,
 
 Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
 
+When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, and `log_level` to `WARN`.
+
 ## Docker Compose
 
 Start the production image with the loopback-only host binding and read-only configuration mount:
@@ -20,7 +22,7 @@ Start the production image with the loopback-only host binding and read-only con
 docker compose up --build
 ```
 
-The container listens on `0.0.0.0:8080`. Compose publishes it as `127.0.0.1:8080:8080`, so OpenCode can reach it locally without exposing the proxy on the network.
+The container listens on `0.0.0.0:8080`. Compose publishes it as `127.0.0.1:58081:8080`, so OpenCode can reach it locally without exposing the proxy on the network.
 
 Stop it with `docker compose down`. SIGTERM cancels active upstream routing and pending Recovery Waits before the process exits.
 
@@ -35,7 +37,7 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 const gonka = createOpenAICompatible({
   name: 'gonka-local',
-  baseURL: 'http://127.0.0.1:8080/v1',
+  baseURL: 'http://127.0.0.1:58081/v1',
   apiKey: 'local-placeholder',
 });
 
@@ -46,7 +48,7 @@ The `baseURL` intentionally ends in `/v1`. Do not configure individual upstream 
 
 ## Operational logs
 
-Logs are written to the container console with timestamps. They identify the Provider name, response code, and parsed upstream error message for non-`200` responses. They also report when a Provider enters or leaves Cooldown. Logs never include request bodies, response bodies, authorization headers, or Provider API keys.
+Logs are written to the container console with timestamps. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation. `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded parsed Provider error message or stream tail that can contain Provider response content; this content is suppressed at `WARN` and `ERROR`. Prompts, request bodies, downstream authorization headers, and Provider API keys are never logged.
 
 ## Container smoke test
 

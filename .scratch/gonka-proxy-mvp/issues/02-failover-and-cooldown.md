@@ -15,7 +15,7 @@ User stories covered: 12–18, 24–25, 28–29.
 ## Acceptance criteria
 
 - [x] HTTP `429`, representative HTTP `5xx`, network failure, and response-header timeout each trigger failover to the next available Provider.
-- [x] The response-header timeout is configurable and defaults to 60 seconds.
+- [x] The response-header timeout is configurable and defaults to 30 seconds.
 - [x] Every Provider is attempted at most once per Routing Pass and attempts follow priority plus declaration-order rules.
 - [x] A Provider enters Cooldown immediately after a Failover Failure; Cooldown is configurable and defaults to 120 seconds.
 - [x] Sequential and concurrent requests skip a Provider whose shared Cooldown is active.

@@ -16,8 +16,8 @@ const (
 	DefaultListenAddress         = "0.0.0.0:8080"
 	DefaultCooldown              = 120 * time.Second
 	DefaultRecoveryWait          = 30 * time.Second
-	DefaultResponseHeaderTimeout = 60 * time.Second
-	DefaultLogLevel              = "INFO"
+	DefaultResponseHeaderTimeout = 30 * time.Second
+	DefaultLogLevel              = "WARN"
 )
 
 // LogLevel is a configurable minimum severity threshold. Lines at or above
@@ -199,7 +199,7 @@ func Load(path string) (Config, error) {
 		Cooldown:              0,
 		RecoveryWait:          0,
 		ResponseHeaderTimeout: 0,
-		LogLevel:              LogLevelInfo,
+		LogLevel:              LogLevel(DefaultLogLevel),
 		ReasoningEffort:       parsedReasoningEffort,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 	}
@@ -254,11 +254,17 @@ func (c Config) Validate() error {
 		return fmt.Errorf(reasoningEffortErrorMsg)
 	}
 
+	seenNames := make(map[string]int, len(c.Providers))
 	seen := make(map[providerIdentity]struct{}, len(c.Providers))
 	for index, provider := range c.Providers {
-		if strings.TrimSpace(provider.Name) == "" {
+		name := strings.TrimSpace(provider.Name)
+		if name == "" {
 			return fmt.Errorf("providers[%d].name must not be empty", index)
 		}
+		if previousIndex, exists := seenNames[name]; exists {
+			return fmt.Errorf("providers[%d].name duplicates providers[%d].name", index, previousIndex)
+		}
+		seenNames[name] = index
 		if strings.TrimSpace(provider.BaseURL) == "" {
 			return fmt.Errorf("providers[%d].base_url must not be empty", index)
 		}
@@ -316,7 +322,7 @@ func parseDuration(field, value string, defaultValue time.Duration) (time.Durati
 func parseLogLevel(value string) (LogLevel, error) {
 	switch LogLevel(strings.ToUpper(strings.TrimSpace(value))) {
 	case "":
-		return LogLevelInfo, nil
+		return LogLevel(DefaultLogLevel), nil
 	case LogLevelInfo:
 		return LogLevelInfo, nil
 	case LogLevelWarn:

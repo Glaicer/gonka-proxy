@@ -33,9 +33,9 @@ recovery_wait: 30s        # wait before probing again when all providers are dow
 response_header_timeout: 30s  # max time to wait for a provider's response headers
 log_level: WARN           # INFO, WARN (default), or ERROR
 
-reasoning_effort: max     # required; see "Reasoning effort" below
+reasoning_effort: xhigh   # required; see "Reasoning effort" below
 
-providers:                # one block per upstream, lower priority = preferred
+providers:                # one block per upstream, higher priority = preferred
   - name: primary
     base_url: https://provider.example/v1   # API root, not a /chat/completions URL
     api_key: your-key
@@ -48,7 +48,9 @@ providers:                # one block per upstream, lower priority = preferred
     priority: 50          # tried only when primary is down or rate-limited
 ```
 
-List your providers in any order; Gonka always tries the **lowest `priority` number first**. Add as many blocks as you like.
+List your providers in any order; Gonka always tries the **highest `priority` number first**. Equal priorities keep YAML declaration order. Add as many blocks as you like.
+
+`log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
 
 ## Reasoning effort
 

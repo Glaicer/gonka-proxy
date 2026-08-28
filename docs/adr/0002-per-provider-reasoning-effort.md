@@ -1,8 +1,10 @@
 # ADR 0002: Per-Provider Reasoning Effort
 
-**Status:** Accepted
+**Status:** Accepted (enum restriction superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md))
 **Date:** 2026-08-25
-**Supersedes (in part):** [ADR 0001](0001-reasoning-effort.md) — the "global-only" clause; all other decisions in ADR 0001 stand.
+**Supersedes (in part):** [ADR 0001](0001-reasoning-effort.md) — the "global-only" clause; its enum restriction, and the restriction repeated here, are superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md). All other decisions in ADR 0001 stand.
+
+This ADR records the original per-Provider policy. Its restricted enum is historical; ADR 0003 is normative for the current accepted values.
 
 ## Context
 
@@ -10,11 +12,11 @@ Not every upstream provider accepts the OpenAI-compatible `reasoning_effort` fie
 
 ## Decision
 
-1. **Optional per-provider key.** Each provider may set `reasoning_effort` in its config entry with the same enum as the global field (`low|high|max|null`). The key is absent by default and old configs remain valid.
+1. **Optional per-provider key.** Each provider may set `reasoning_effort` in its config entry with the same enum as the global field (`low|high|max|null` at the time). The key is absent by default and old configs remain valid.
 
 2. **Resolution order.** Per provider: an explicit `null` strips the field for that provider; otherwise a configured value overrides the global one; otherwise the provider inherits the global value. Resolution happens once at proxy construction, so routing applies it identically on every Routing Pass.
 
-3. **Same restricted enum, same strictness.** Provider values are case-insensitive and whitespace-trimmed like the global value; quoted `"null"` and empty strings are errors, reported as `providers[N].reasoning_effort must be one of low, high, max, null`.
+3. **Same restricted enum, same strictness (historical; superseded by ADR 0003).** Provider values were case-insensitive and whitespace-trimmed like the global value; quoted `"null"` and empty strings were errors, reported as `providers[N].reasoning_effort must be one of low, high, max, null`.
 
 4. **Global stays required.** The top-level `reasoning_effort` remains mandatory; per-provider entries only override or exempt.
 
@@ -22,7 +24,7 @@ Not every upstream provider accepts the OpenAI-compatible `reasoning_effort` fie
 
 - Providers that reject `reasoning_effort` can be opted out with `reasoning_effort: ~` on their config entry.
 - `applyUpstreamOverrides` is unchanged; each provider now carries its resolved effort from startup.
-- Widening the enum later still requires a config validation change for both scopes.
+- The enum restriction here is superseded by ADR 0003; both scopes now use its expanded value set.
 
 ## Alternatives Considered
 

@@ -36,8 +36,8 @@ providers:
 	if cfg.ResponseHeaderTimeout != config.DefaultResponseHeaderTimeout {
 		t.Errorf("ResponseHeaderTimeout = %s, want %s", cfg.ResponseHeaderTimeout, config.DefaultResponseHeaderTimeout)
 	}
-	if cfg.LogLevel != config.LogLevelInfo {
-		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, config.LogLevelInfo)
+	if cfg.LogLevel != config.LogLevelWarn {
+		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, config.LogLevelWarn)
 	}
 }
 
@@ -194,6 +194,23 @@ providers:
 			want: "providers[1] duplicates another Provider definition",
 		},
 		{
+			name: "duplicate Provider names after trimming",
+			contents: `reasoning_effort: max
+providers:
+  - name: " primary "
+    base_url: https://primary.example/v1
+    api_key: primary-secret
+    model_alias: primary-model
+    priority: 10
+  - name: primary
+    base_url: https://backup.example/v1
+    api_key: backup-secret
+    model_alias: backup-model
+    priority: 5
+`,
+			want: "providers[1].name duplicates providers[0].name",
+		},
+		{
 			name: "unusable Provider URL",
 			contents: `reasoning_effort: max
 providers:
@@ -226,6 +243,29 @@ providers:
 				t.Fatalf("error = %q, want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadAcceptsDistinctProviderNames(t *testing.T) {
+	cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: " primary "
+    base_url: https://primary.example/v1
+    api_key: primary-secret
+    model_alias: primary-model
+    priority: 10
+  - name: backup
+    base_url: https://backup.example/v1
+    api_key: backup-secret
+    model_alias: backup-model
+    priority: 5
+`)
+
+	if len(cfg.Providers) != 2 {
+		t.Fatalf("providers = %d, want 2", len(cfg.Providers))
+	}
+	if cfg.Providers[0].Name != "primary" || cfg.Providers[1].Name != "backup" {
+		t.Errorf("provider names = %q, %q, want %q, %q", cfg.Providers[0].Name, cfg.Providers[1].Name, "primary", "backup")
 	}
 }
 

@@ -20,7 +20,18 @@ import (
 
 const chatCompletionsPath = "/v1/chat/completions"
 
-const maxLoggedErrorMessageLength = 512
+const (
+	maxLoggedErrorMessageLength = 512
+	sseDoneMarker               = "[DONE]"
+	streamAbortBuf              = 64
+	sseDoneLineMax              = len("data: [DONE]") + 1 // include an optional CR
+
+	// Error responses are read only long enough to extract a concise INFO log
+	// message. A timer closes the response body if an upstream stalls after
+	// sending failover headers.
+	maxErrorBodyBytes    = 64 * 1024
+	errorBodyReadTimeout = 100 * time.Millisecond
+)
 
 // Logger is the operational logging surface used by the proxy.
 type Logger interface {
@@ -63,6 +74,10 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
+	logLevel := cfg.LogLevel
+	if logLevel == "" {
+		logLevel = config.LogLevelWarn
+	}
 
 	// Normalize programmatic Config values (e.g. "MAX") to lower; Load already normalizes.
 	normalizedEffort := normalizeReasoningEffort(cfg.ReasoningEffort)
@@ -98,7 +113,7 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 			Transport: transport,
 		},
 		logger:   logger,
-		logLevel: cfg.LogLevel,
+		logLevel: logLevel,
 	}, nil
 }
 
@@ -176,7 +191,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			if !s.providerAvailable(selected, time.Now()) {
 				continue
 			}
-			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", selected.Name, selected.Priority)
+			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
 
 			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
 			if err != nil {
@@ -213,15 +228,19 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			}
 
 			if upstreamResponse.StatusCode != http.StatusOK {
-				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
-				_ = upstreamResponse.Body.Close()
-				errorMessage := errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
-				if readErr != nil {
-					errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
-				}
-				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
-
 				if isFailoverStatus(upstreamResponse.StatusCode) {
+					var errorMessage string
+					if s.payloadLoggingEnabled() {
+						responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
+						if readErr == nil && len(responseBody) > 0 {
+							errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
+						}
+					} else {
+						_ = upstreamResponse.Body.Close()
+					}
+					_ = upstreamResponse.Body.Close()
+					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
+
 					category := "server-error"
 					if upstreamResponse.StatusCode == http.StatusTooManyRequests {
 						category = "rate-limit"
@@ -229,6 +248,16 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 					continue
 				}
+
+				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+				_ = upstreamResponse.Body.Close()
+				errorMessage := ""
+				if readErr != nil {
+					errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
+				} else if len(responseBody) > 0 {
+					errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
+				}
+				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
@@ -310,9 +339,74 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	}
 	s.cooldownMu.Unlock()
 	for _, selected := range cleared {
-		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", selected.Name)
+		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", s.redactProviderSecrets(selected.Name))
 	}
 	return len(cleared)
+}
+
+// dataChunk is a small accumulator used to detect SSE termination markers that
+// may straddle two read() boundaries.
+type dataChunk struct {
+	buf          []byte
+	line         []byte
+	started      bool
+	done         bool
+	lineTooLong  bool
+	rawTailLimit int
+}
+
+func newDataChunk(rawTailLimit int) *dataChunk {
+	if rawTailLimit < streamAbortBuf {
+		rawTailLimit = streamAbortBuf
+	}
+	return &dataChunk{rawTailLimit: rawTailLimit}
+}
+
+func (c *dataChunk) observe(p []byte) {
+	c.buf = append(c.buf, p...)
+	if len(c.buf) > c.rawTailLimit {
+		c.buf = c.buf[len(c.buf)-c.rawTailLimit:]
+	}
+	if len(c.buf) > 0 {
+		c.started = true
+	}
+
+	for _, value := range p {
+		if c.done {
+			continue
+		}
+		if value == '\n' {
+			if !c.lineTooLong && isSSEDoneLine(c.line) {
+				c.done = true
+			}
+			c.line = c.line[:0]
+			c.lineTooLong = false
+			continue
+		}
+		if c.lineTooLong {
+			continue
+		}
+		if len(c.line) >= sseDoneLineMax {
+			c.lineTooLong = true
+			continue
+		}
+		c.line = append(c.line, value)
+	}
+}
+
+func (c *dataChunk) sawDone() bool {
+	if !c.started || c.lineTooLong {
+		return false
+	}
+	return c.done || isSSEDoneLine(c.line)
+}
+
+func isSSEDoneLine(line []byte) bool {
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return bytes.Equal(line, []byte("data:"+sseDoneMarker)) ||
+		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
 func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
@@ -322,14 +416,20 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 	}
 
 	buffer := make([]byte, 32*1024)
+	var sentBytes int64
+	var chunks int64
+	acc := newDataChunk(s.streamTailLimit())
+
 	for {
 		readCount, readErr := body.Read(buffer)
 		if readCount > 0 {
 			chunk := buffer[:readCount]
+			acc.observe(chunk)
+			sentBytes += int64(readCount)
+			chunks++
 			if _, writeErr := w.Write(chunk); writeErr != nil {
-				if r.Context().Err() != nil {
-					s.logCancellation("stream")
-				}
+				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+					fmt.Sprintf("client-write error: %v", writeErr))
 				return
 			}
 			if canFlush {
@@ -341,15 +441,61 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			continue
 		}
 		if errors.Is(readErr, io.EOF) {
+			if acc.sawDone() {
+				return
+			}
+			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
+			s.markCooldown(selected)
 			return
 		}
 		if r.Context().Err() != nil {
-			s.logCancellation("stream")
+			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+				fmt.Sprintf("upstream read error: %v (request context canceled during stream)", readErr))
 			return
 		}
+		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(selected, "stream", statusCode)
 		return
 	}
+}
+
+func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+	providerName := s.redactProviderSecrets(selected.Name)
+	redactedReason := s.redactProviderSecrets(reason)
+	if s.payloadLoggingEnabled() {
+		s.logAt(config.LogLevelInfo, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s tail=%q",
+			providerName, statusCode, sentBytes, chunks, redactedReason, s.redactedTail(acc))
+		return
+	}
+	s.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
+		providerName, statusCode, sentBytes, chunks, redactedReason)
+}
+
+func tail(acc *dataChunk) string {
+	if acc == nil {
+		return ""
+	}
+	return string(acc.buf)
+}
+
+func (s *Server) redactedTail(acc *dataChunk) string {
+	value := s.redactProviderSecrets(tail(acc))
+	if len(value) > streamAbortBuf {
+		value = value[len(value)-streamAbortBuf:]
+	}
+	return value
+}
+
+func (s *Server) streamTailLimit() int {
+	maxSecretLength := 0
+	for _, selected := range s.providers {
+		if len(selected.APIKey) > maxSecretLength {
+			maxSecretLength = len(selected.APIKey)
+		}
+	}
+	return streamAbortBuf + maxSecretLength
 }
 
 func isStreamingResponse(response *http.Response, payload map[string]json.RawMessage) bool {
@@ -385,25 +531,20 @@ func (s *Server) markCooldown(selected *provider) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
-	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", selected.Name, s.cooldownDuration)
+	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
 	if statusCode > 0 {
-		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", selected.Name, category, statusCode)
+		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", s.redactProviderSecrets(selected.Name), category, statusCode)
 	} else {
-		s.logAt(config.LogLevelWarn, "%s - failover - %s", selected.Name, category)
+		s.logAt(config.LogLevelWarn, "%s - failover - %s", s.redactProviderSecrets(selected.Name), category)
 	}
 	s.markCooldown(selected)
 }
 
 func (s *Server) logCancellation(phase string) {
 	s.logAt(config.LogLevelInfo, "request canceled - %s", phase)
-}
-
-// logf writes a line unconditionally (used for always-on operational output).
-func (s *Server) logf(format string, args ...any) {
-	s.logger.Printf(format, args...)
 }
 
 // logAt writes a line only if the configured level permits it.
@@ -414,12 +555,73 @@ func (s *Server) logAt(level config.LogLevel, format string, args ...any) {
 	s.logger.Printf(format, args...)
 }
 
+func (s *Server) payloadLoggingEnabled() bool {
+	return s.logLevel == config.LogLevelInfo
+}
+
 func (s *Server) logProviderResponse(selected *provider, statusCode int, errorMessage string) {
-	if errorMessage == "" {
-		s.logf("%s status=%d", selected.Name, statusCode)
+	if statusCode == http.StatusOK && errorMessage == "" {
+		s.logAt(config.LogLevelInfo, "%s status=%d", s.redactProviderSecrets(selected.Name), statusCode)
 		return
 	}
-	s.logAt(config.LogLevelError, "%s error - status=%d - %s", selected.Name, statusCode, sanitizeErrorMessage(errorMessage))
+	if statusCode > 0 {
+		if errorMessage != "" && s.payloadLoggingEnabled() {
+			s.logAt(config.LogLevelInfo, "%s error - status=%d - %s", s.redactProviderSecrets(selected.Name), statusCode, s.sanitizeLogMessage(errorMessage))
+			return
+		}
+		s.logAt(config.LogLevelError, "%s error - status=%d", s.redactProviderSecrets(selected.Name), statusCode)
+		return
+	}
+	if errorMessage == "" {
+		s.logAt(config.LogLevelError, "%s error", s.redactProviderSecrets(selected.Name))
+		return
+	}
+	s.logAt(config.LogLevelError, "%s error - %s", s.redactProviderSecrets(selected.Name), s.sanitizeLogMessage(errorMessage))
+}
+
+func (s *Server) sanitizeLogMessage(message string) string {
+	return sanitizeErrorMessage(s.redactProviderSecrets(message))
+}
+
+func (s *Server) redactProviderSecrets(message string) string {
+	secrets := make([]string, 0, len(s.providers))
+	seen := make(map[string]struct{}, len(s.providers))
+	for _, selected := range s.providers {
+		secret := selected.APIKey
+		if secret == "" {
+			continue
+		}
+		if _, exists := seen[secret]; exists {
+			continue
+		}
+		seen[secret] = struct{}{}
+		secrets = append(secrets, secret)
+	}
+	sort.Slice(secrets, func(i, j int) bool {
+		return len(secrets[i]) > len(secrets[j])
+	})
+	for _, secret := range secrets {
+		message = strings.ReplaceAll(message, "Bearer "+secret, "Bearer [REDACTED]")
+		message = strings.ReplaceAll(message, "bearer "+secret, "bearer [REDACTED]")
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+	}
+	return message
+}
+
+func readErrorBodyForLog(body io.ReadCloser) ([]byte, error) {
+	timer := time.AfterFunc(errorBodyReadTimeout, func() {
+		_ = body.Close()
+	})
+	defer timer.Stop()
+
+	responseBody, err := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(responseBody) > maxErrorBodyBytes {
+		return nil, fmt.Errorf("upstream error response exceeds %d bytes", maxErrorBodyBytes)
+	}
+	return responseBody, nil
 }
 
 func errorMessageFromResponse(body []byte, statusCode int) string {
@@ -432,21 +634,21 @@ func errorMessageFromResponse(body []byte, statusCode int) string {
 		if len(payload.Error) > 0 && string(payload.Error) != "null" {
 			var errorText string
 			if json.Unmarshal(payload.Error, &errorText) == nil && strings.TrimSpace(errorText) != "" {
-				return sanitizeErrorMessage(errorText)
+				return errorText
 			}
 
 			var structuredError struct {
 				Message string `json:"message"`
 			}
 			if json.Unmarshal(payload.Error, &structuredError) == nil && strings.TrimSpace(structuredError.Message) != "" {
-				return sanitizeErrorMessage(structuredError.Message)
+				return structuredError.Message
 			}
 		}
 		if strings.TrimSpace(payload.Message) != "" {
-			return sanitizeErrorMessage(payload.Message)
+			return payload.Message
 		}
 		if strings.TrimSpace(payload.Detail) != "" {
-			return sanitizeErrorMessage(payload.Detail)
+			return payload.Detail
 		}
 	}
 

@@ -44,6 +44,7 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 		Cooldown:              time.Minute,
 		RecoveryWait:          time.Minute,
 		ResponseHeaderTimeout: time.Second,
+		LogLevel:              config.LogLevelInfo,
 		ReasoningEffort:       &reasoningMax,
 		Providers: []config.Provider{
 			{Name: "primary", BaseURL: primaryProvider.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100},
@@ -85,6 +86,170 @@ func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsPayloadLogsOnlyAtInfo(t *testing.T) {
+	for _, logLevel := range []config.LogLevel{
+		config.LogLevelInfo,
+		config.LogLevelWarn,
+		config.LogLevelError,
+		"",
+	} {
+		t.Run(string(logLevel), func(t *testing.T) {
+			t.Run("provider error body", func(t *testing.T) {
+				const errorMessage = "provider-error-payload-diagnostic"
+				const primaryAPIKey = "primary-secret"
+				const backupAPIKey = "backup-secret"
+				primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = io.WriteString(w, `{"error":{"message":"`+errorMessage+` reflected Bearer `+primaryAPIKey+` and `+backupAPIKey+`"}}`)
+				}))
+				defer primaryProvider.Close()
+
+				backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"provider":"backup"}`)
+				}))
+				defer backupProvider.Close()
+
+				server, logs := newLoggedProxyServer(t, []providerFixture{
+					{baseURL: primaryProvider.URL + "/v1", apiKey: primaryAPIKey, modelAlias: "primary-model", priority: 100},
+					{baseURL: backupProvider.URL + "/v1", apiKey: backupAPIKey, modelAlias: "backup-model", priority: 50},
+				}, logLevel)
+				defer server.Close()
+
+				response, err := http.Post(
+					server.URL+"/v1/chat/completions",
+					"application/json",
+					strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+				)
+				if err != nil {
+					t.Fatalf("proxy request: %v", err)
+				}
+				if _, err := io.ReadAll(response.Body); err != nil {
+					t.Fatalf("read response: %v", err)
+				}
+				_ = response.Body.Close()
+
+				output := logs.String()
+				gotPayload := strings.Contains(output, errorMessage)
+				wantPayload := logLevel == config.LogLevelInfo
+				if gotPayload != wantPayload {
+					t.Fatalf("logs = %q, payload present = %t, want %t", output, gotPayload, wantPayload)
+				}
+				for _, secret := range []string{primaryAPIKey, backupAPIKey, "Bearer " + primaryAPIKey} {
+					if strings.Contains(output, secret) {
+						t.Fatalf("logs contain reflected Provider secret %q: %q", secret, output)
+					}
+				}
+				successLogged := strings.Contains(output, "provider-1 status=200")
+				if successLogged != wantPayload {
+					t.Fatalf("success status log present = %t, want %t at %s", successLogged, wantPayload, logLevel)
+				}
+			})
+
+			t.Run("stream tail", func(t *testing.T) {
+				const streamTail = "stream-tail-payload-diagnostic"
+				const primaryAPIKey = "provider-secret"
+				const backupAPIKey = "backup-secret"
+				provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, "data: {\"detail\":\"reflected Bearer "+primaryAPIKey+" and "+backupAPIKey+" "+streamTail+"\"}\n\n")
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				}))
+				defer provider.Close()
+				backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"provider":"backup"}`)
+				}))
+				defer backupProvider.Close()
+
+				server, logs := newLoggedProxyServer(t, []providerFixture{
+					{baseURL: provider.URL + "/v1", apiKey: primaryAPIKey, modelAlias: "provider-model", priority: 100},
+					{baseURL: backupProvider.URL + "/v1", apiKey: backupAPIKey, modelAlias: "backup-model", priority: 50},
+				}, logLevel)
+				defer server.Close()
+
+				response, err := http.Post(
+					server.URL+"/v1/chat/completions",
+					"application/json",
+					strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+				)
+				if err != nil {
+					t.Fatalf("proxy request: %v", err)
+				}
+				if _, err := io.ReadAll(response.Body); err != nil {
+					t.Fatalf("read stream: %v", err)
+				}
+				_ = response.Body.Close()
+
+				output := logs.String()
+				gotPayload := strings.Contains(output, streamTail)
+				wantPayload := logLevel == config.LogLevelInfo
+				if gotPayload != wantPayload {
+					t.Fatalf("logs = %q, stream tail present = %t, want %t", output, gotPayload, wantPayload)
+				}
+				for _, secret := range []string{primaryAPIKey, backupAPIKey, "Bearer " + primaryAPIKey} {
+					if strings.Contains(output, secret) {
+						t.Fatalf("logs contain reflected Provider secret %q: %q", secret, output)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestChatCompletionsRedactsProviderNamesAtInfoAndDefaultWarn(t *testing.T) {
+	for _, logLevel := range []config.LogLevel{config.LogLevelInfo, ""} {
+		t.Run(string(logLevel), func(t *testing.T) {
+			const primaryAPIKey = "primary-name-secret"
+			const backupAPIKey = "backup-name-secret"
+			primaryName := "primary-" + primaryAPIKey + "-and-" + backupAPIKey
+			backupName := "backup-" + backupAPIKey + "-and-" + primaryAPIKey
+
+			primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+			}))
+			defer primaryProvider.Close()
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"provider":"backup"}`)
+			}))
+			defer backupProvider.Close()
+
+			server, logs := newLoggedProxyServer(t, []providerFixture{
+				{name: primaryName, baseURL: primaryProvider.URL + "/v1", apiKey: primaryAPIKey, modelAlias: "primary-model", priority: 100},
+				{name: backupName, baseURL: backupProvider.URL + "/v1", apiKey: backupAPIKey, modelAlias: "backup-model", priority: 50},
+			}, logLevel)
+			defer server.Close()
+
+			response, err := http.Post(
+				server.URL+"/v1/chat/completions",
+				"application/json",
+				strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+			)
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			_ = response.Body.Close()
+
+			output := logs.String()
+			for _, secret := range []string{primaryAPIKey, backupAPIKey} {
+				if strings.Contains(output, secret) {
+					t.Fatalf("logs contain Provider-name secret %q: %q", secret, output)
+				}
+			}
+			if !strings.Contains(output, "[REDACTED]") {
+				t.Fatalf("logs = %q, want redacted Provider-name diagnostics", output)
+			}
+		})
+	}
+}
+
 func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 	logs := &recoveryWaitLogWriter{started: make(chan struct{}), canceled: make(chan struct{})}
 	logger := log.New(logs, "", 0)
@@ -100,6 +265,7 @@ func TestChatCompletionsLogsRecoveryWaitCancellation(t *testing.T) {
 		Cooldown:              time.Hour,
 		RecoveryWait:          time.Hour,
 		ResponseHeaderTimeout: time.Second,
+		LogLevel:              config.LogLevelInfo,
 		Providers: []config.Provider{
 			{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
 		},
@@ -372,6 +538,79 @@ func TestChatCompletionsFailsOverOnRateLimit(t *testing.T) {
 	}
 	if got := backupHits.Load(); got != 1 {
 		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsFailsOverWithoutReadingStalledFailoverBody(t *testing.T) {
+	for _, statusCode := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			var failedHits atomic.Int32
+			var backupHits atomic.Int32
+			releaseFailedProvider := make(chan struct{})
+			var releaseOnce sync.Once
+
+			failedProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				failedHits.Add(1)
+				w.WriteHeader(statusCode)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				// Headers are available, but the body never reaches EOF until the test
+				// releases the handler. The proxy must fail over without waiting for it.
+				select {
+				case <-releaseFailedProvider:
+				case <-r.Context().Done():
+				}
+			}))
+			defer func() {
+				releaseOnce.Do(func() { close(releaseFailedProvider) })
+				failedProvider.Close()
+			}()
+
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"provider":"backup"}`)
+			}))
+			defer backupProvider.Close()
+
+			server := newProxyServerWithTiming(t, []providerFixture{
+				{baseURL: failedProvider.URL + "/v1", apiKey: "failed-secret", modelAlias: "failed-model", priority: 100},
+				{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+			}, time.Second, time.Second)
+			defer server.Close()
+
+			startedAt := time.Now()
+			client := &http.Client{Timeout: 500 * time.Millisecond}
+			response, err := client.Post(
+				server.URL+"/v1/chat/completions",
+				"application/json",
+				strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+			)
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer response.Body.Close()
+			if elapsed := time.Since(startedAt); elapsed >= 400*time.Millisecond {
+				t.Fatalf("request took %s, want failover without waiting for body", elapsed)
+			}
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusOK)
+			}
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if string(body) != `{"provider":"backup"}` {
+				t.Fatalf("response body = %s, want backup response", body)
+			}
+			if got := failedHits.Load(); got != 1 {
+				t.Fatalf("failed Provider received %d requests, want 1", got)
+			}
+			if got := backupHits.Load(); got != 1 {
+				t.Fatalf("backup Provider received %d requests, want 1", got)
+			}
+		})
 	}
 }
 
@@ -1351,6 +1590,201 @@ func TestChatCompletionsMarksInterruptedStreamCooldownWithoutFailover(t *testing
 	}
 }
 
+func TestChatCompletionsMarksNormalEOFWithoutDoneCooldownWithoutFailover(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+	const interruptedChunk = "data: {\"provider\":\"primary\",\"content\":\"[DONE]\"}\n\n"
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, interruptedChunk)
+		flusher.Flush()
+		// Returning normally produces a clean EOF without the required [DONE] marker.
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, time.Second, time.Second)
+	defer server.Close()
+
+	firstResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+	)
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	firstBody, err := io.ReadAll(firstResponse.Body)
+	_ = firstResponse.Body.Close()
+	if err != nil {
+		t.Fatalf("read first stream: %v", err)
+	}
+	if firstResponse.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", firstResponse.StatusCode, http.StatusOK)
+	}
+	if string(firstBody) != interruptedChunk {
+		t.Fatalf("first body = %q, want %q", firstBody, interruptedChunk)
+	}
+	if got := backupHits.Load(); got != 0 {
+		t.Fatalf("backup Provider received %d requests during interrupted stream, want 0", got)
+	}
+
+	secondResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatalf("second proxy request: %v", err)
+	}
+	defer secondResponse.Body.Close()
+	secondBody, err := io.ReadAll(secondResponse.Body)
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if secondResponse.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", secondResponse.StatusCode, http.StatusOK)
+	}
+	if string(secondBody) != `{"provider":"backup"}` {
+		t.Fatalf("second body = %s, want backup response", secondBody)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1 while cooldown is active", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
+func TestChatCompletionsRedactsProviderKeyAcrossStreamTailBoundary(t *testing.T) {
+	const apiKey = "provider-key-SECRET-0123456789"
+	const secretSuffix = "SECRET-0123456789"
+	const usefulTail = "nonsecret-tail-marker"
+	streamBody := "data: " + strings.Repeat("x", 60) + apiKey + strings.Repeat("y", 20) + " " + usefulTail + "\n\n"
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, streamBody)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer provider.Close()
+
+	server, logs := newLoggedProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: apiKey, modelAlias: "provider-model", priority: 1},
+	}, config.LogLevelInfo)
+	defer server.Close()
+
+	response, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+	)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	_ = response.Body.Close()
+
+	output := logs.String()
+	for _, secret := range []string{apiKey, secretSuffix} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("logs contain full or partial Provider key %q: %q", secret, output)
+		}
+	}
+	if !strings.Contains(output, usefulTail) {
+		t.Fatalf("logs = %q, want useful nonsecret stream tail", output)
+	}
+}
+
+func TestChatCompletionsDoesNotTreatLongDataLineSuffixAsDone(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+	const doneLikeSuffix = "data:[DONE]"
+	longDataLine := "data: {\"payload\":\"" + strings.Repeat("x", 100) + doneLikeSuffix + strings.Repeat("y", 60) + "\"}\n\n"
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, longDataLine)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, time.Second, time.Second)
+	defer server.Close()
+
+	firstResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`),
+	)
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	if _, err := io.ReadAll(firstResponse.Body); err != nil {
+		t.Fatalf("read first stream: %v", err)
+	}
+	_ = firstResponse.Body.Close()
+
+	secondResponse, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatalf("second proxy request: %v", err)
+	}
+	defer secondResponse.Body.Close()
+	secondBody, err := io.ReadAll(secondResponse.Body)
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if string(secondBody) != `{"provider":"backup"}` {
+		t.Fatalf("second body = %s, want backup response", secondBody)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1 after long data line", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
 func TestChatCompletionsCancelsStreamingProviderOnClientCancellation(t *testing.T) {
 	streamStarted := make(chan struct{})
 	streamCanceled := make(chan struct{})
@@ -1838,6 +2272,41 @@ func newProxyServerWithTiming(t *testing.T, providers []providerFixture, cooldow
 func newProxyServerWithRecoveryTiming(t *testing.T, providers []providerFixture, cooldown, recoveryWait, responseHeaderTimeout time.Duration) *httptest.Server {
 	t.Helper()
 	return newProxyServerWithTimingValuesAndRecovery(t, providers, cooldown.String(), recoveryWait.String(), responseHeaderTimeout.String())
+}
+
+func newLoggedProxyServer(t *testing.T, providers []providerFixture, logLevel config.LogLevel) (*httptest.Server, *bytes.Buffer) {
+	t.Helper()
+
+	reasoningMax := config.ReasoningEffortMax
+	configuredProviders := make([]config.Provider, 0, len(providers))
+	for index, provider := range providers {
+		name := provider.name
+		if name == "" {
+			name = fmt.Sprintf("provider-%d", index)
+		}
+		configuredProviders = append(configuredProviders, config.Provider{
+			Name:       name,
+			BaseURL:    provider.baseURL,
+			APIKey:     provider.apiKey,
+			ModelAlias: provider.modelAlias,
+			Priority:   provider.priority,
+		})
+	}
+
+	var logs bytes.Buffer
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		LogLevel:              logLevel,
+		ReasoningEffort:       &reasoningMax,
+		Providers:             configuredProviders,
+	}, log.New(&logs, "", 0))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	return httptest.NewServer(handler), &logs
 }
 
 func newProxyServerWithTimingValues(t *testing.T, providers []providerFixture, cooldown, responseHeaderTimeout string) *httptest.Server {

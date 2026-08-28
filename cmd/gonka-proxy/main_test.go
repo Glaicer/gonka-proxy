@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,102 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRunRejectsInvalidStartupConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		wantErr  string
+	}{
+		{
+			name:     "malformed YAML",
+			contents: "reasoning_effort: null\nproviders:\n  - [",
+			wantErr:  "load configuration: decode config",
+		},
+		{
+			name: "invalid duration",
+			contents: `reasoning_effort: null
+cooldown: soon
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`,
+			wantErr: "cooldown must be a valid duration",
+		},
+		{
+			name: "missing Provider field",
+			contents: `reasoning_effort: null
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    model_alias: provider-model
+    priority: 10
+`,
+			wantErr: "providers[0].api_key must not be empty",
+		},
+		{
+			name:     "empty Provider list",
+			contents: "reasoning_effort: null\nproviders: []\n",
+			wantErr:  "providers must contain at least one Provider",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(test.contents), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			err := run(context.Background(), configPath, log.New(io.Discard, "", 0))
+			if err == nil {
+				t.Fatal("run succeeded for invalid configuration")
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunDuplicateProviderNameDoesNotLeakAPIKey(t *testing.T) {
+	const secret = "provider-secret-key"
+	contents := `reasoning_effort: null
+providers:
+  - name: "` + secret + `"
+    base_url: https://primary.example/v1
+    api_key: ` + secret + `
+    model_alias: primary-model
+    priority: 10
+  - name: " ` + secret + ` "
+    base_url: https://backup.example/v1
+    api_key: backup-secret-key
+    model_alias: backup-model
+    priority: 5
+`
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var logs bytes.Buffer
+	err := run(context.Background(), configPath, log.New(&logs, "", 0))
+	if err == nil {
+		t.Fatal("run succeeded for duplicate Provider names")
+	}
+	if !strings.Contains(err.Error(), "providers[1].name duplicates providers[0].name") {
+		t.Fatalf("error = %q, want actionable duplicate-index error", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error leaked API key %q: %q", secret, err)
+	}
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("startup logs leaked API key %q: %q", secret, logs.String())
+	}
+}
 
 func TestRunShutsDownActiveRoutingOnContextCancellation(t *testing.T) {
 	upstreamStarted := make(chan struct{})
