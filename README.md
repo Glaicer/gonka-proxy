@@ -8,7 +8,7 @@ Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can ru
 
 - Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream.
 - Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
-- On a **429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
+- On a **402, 429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
 - A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
 - Maps your **virtual model name** to each provider's real model, so clients don't need to know or care which upstream you're using.
 - Enforces one **reasoning effort** setting on every upstream request, with per-provider overrides for backends that don't support the parameter.

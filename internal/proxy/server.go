@@ -242,7 +242,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
 					category := "server-error"
-					if upstreamResponse.StatusCode == http.StatusTooManyRequests {
+					switch upstreamResponse.StatusCode {
+					case http.StatusPaymentRequired:
+						category = "payment-required"
+					case http.StatusTooManyRequests:
 						category = "rate-limit"
 					}
 					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
@@ -685,6 +688,7 @@ func isResponseHeaderTimeout(err error) bool {
 
 func isFailoverStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusPaymentRequired ||
 		(statusCode >= http.StatusInternalServerError && statusCode <= 599)
 }
 

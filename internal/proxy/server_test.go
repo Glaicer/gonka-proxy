@@ -571,8 +571,56 @@ func TestChatCompletionsFailsOverOnRateLimit(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsFailsOverOnPaymentRequired(t *testing.T) {
+	var paymentRequiredHits atomic.Int32
+	var backupHits atomic.Int32
+
+	paymentRequiredProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paymentRequiredHits.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, `{"error":"insufficient credits"}`)
+	}))
+	defer paymentRequiredProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: paymentRequiredProvider.URL + "/v1", apiKey: "payment-required-secret", modelAlias: "payment-required-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(responseBody) != `{"provider":"backup"}` {
+		t.Fatalf("response body = %s, want backup response", responseBody)
+	}
+	if got := paymentRequiredHits.Load(); got != 1 {
+		t.Fatalf("payment-required Provider received %d requests, want 1", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+}
+
 func TestChatCompletionsFailsOverWithoutReadingStalledFailoverBody(t *testing.T) {
-	for _, statusCode := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+	for _, statusCode := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusPaymentRequired} {
 		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
 			var failedHits atomic.Int32
 			var backupHits atomic.Int32
