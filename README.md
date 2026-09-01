@@ -110,6 +110,28 @@ docker compose up --build
 
 This publishes the proxy on `127.0.0.1:58081` and mounts `config.yaml` read-only. Point your app at `http://127.0.0.1:58081/v1`.
 
+**Multiple instances:** to run several proxies side by side (each with its own providers, cooldowns, and log level), copy `compose.multi.example.yaml` to `compose.yaml` and give each service its own config file and host port:
+
+```yaml
+services:
+  proxy-a:
+    build: .
+    command: ["--config", "/etc/gonka-proxy/config.yaml"]
+    ports:
+      - "127.0.0.1:58081:8080"
+    volumes:
+      - ./config-a.yaml:/etc/gonka-proxy/config.yaml:ro
+  proxy-b:
+    build: .
+    command: ["--config", "/etc/gonka-proxy/config.yaml"]
+    ports:
+      - "127.0.0.1:58082:8080"
+    volumes:
+      - ./config-b.yaml:/etc/gonka-proxy/config.yaml:ro
+```
+
+Every service mounts its config at the same in-container path (`/etc/gonka-proxy/config.yaml`) — only the host-side file differs. `config-*.yaml` and `compose.yaml` are gitignored, so per-instance credentials never get committed.
+
 **Native (no Docker):**
 
 ```sh

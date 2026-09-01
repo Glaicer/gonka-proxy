@@ -1,5 +1,7 @@
 # Local config with real credentials (never commit)
 config.yaml
+config-*.yaml
+compose.yaml
 
 # Build artifacts
 /gonka-proxy

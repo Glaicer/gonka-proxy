@@ -1,0 +1,23 @@
+# Multiple independent proxy instances, each with its own config file,
+# provider pool, cooldowns, and log level.
+# Copy to compose.yaml (gitignored) and create config-a.yaml / config-b.yaml.
+services:
+  proxy-a:
+    build: .
+    container_name: gonka-proxy-a
+    command: ["--config", "/etc/gonka-proxy/config.yaml"]
+    ports:
+      - "127.0.0.1:58081:8080"
+    volumes:
+      - ./config-a.yaml:/etc/gonka-proxy/config.yaml:ro
+    restart: unless-stopped
+
+  proxy-b:
+    build: .
+    container_name: gonka-proxy-b
+    command: ["--config", "/etc/gonka-proxy/config.yaml"]
+    ports:
+      - "127.0.0.1:58082:8080"
+    volumes:
+      - ./config-b.yaml:/etc/gonka-proxy/config.yaml:ro
+    restart: unless-stopped
