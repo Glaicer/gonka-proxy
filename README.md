@@ -76,7 +76,7 @@ The same rules apply after failover: each provider always gets its own resolved 
 
 ### Provider support
 
-> ***The data is current as of 2026-08-25. If you would like to add new data or update existing information, please open an issue and I will make the changes.***
+> ***The data is current as of 2026-09-02. If you would like to add new data or update existing information, please open an issue and I will make the changes.***
 
 Values each provider currently accepts for DeepSeek V4 Flash 0731 model:
 
@@ -88,8 +88,9 @@ Values each provider currently accepts for DeepSeek V4 Flash 0731 model:
 | GonkaGate      | OK  | OK     | OK   | OK    | OK  |
 | Gonka-API      | OK  | OK     | OK   | OK    | OK  |
 
+**Note**: it seems that sometimes `reasoning_effort: max` support depends on devshard/node and might be unstable. Consider adding `reasoning_effort: high` fallbacks to your config.
 
-An unsupported value makes the provider answer with **HTTP 400**, which is passed back to your app unchanged — it does **not** fail over. Point those providers at a value they accept (or `~` to strip the field) with a per-provider `reasoning_effort`.
+A provider that does not support the configured value answers with **HTTP 400** and an error like `reasoning_effort: unsupported value: ...`. The proxy detects that message and **fails over** to the next provider, so a single unsupported provider no longer breaks the request. Other 400 responses are still passed back to your app unchanged. To avoid repeated cooldowns, point those providers at a value they accept (or `~` to strip the field) with a per-provider `reasoning_effort`.
 
 To check provider support against your own configuration, run:
 

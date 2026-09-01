@@ -262,6 +262,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				}
 				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
+				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage) {
+					s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
+					continue
+				}
+
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
@@ -690,6 +695,19 @@ func isFailoverStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests ||
 		statusCode == http.StatusPaymentRequired ||
 		(statusCode >= http.StatusInternalServerError && statusCode <= 599)
+}
+
+// isReasoningEffortUnsupportedError detects the provider-side rejection of an
+// unsupported reasoning_effort value. Providers answer with HTTP 400 and a
+// body like {"error":{"message":"reasoning_effort: unsupported value: ..."}},
+// which is a request-shaping problem the proxy can fix by failing over to a
+// provider that accepts the configured value.
+func isReasoningEffortUnsupportedError(statusCode int, errorMessage string) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	message := strings.ToLower(errorMessage)
+	return strings.Contains(message, "reasoning_effort") && strings.Contains(message, "unsupported value")
 }
 
 func chatCompletionsURL(baseURL string) (string, error) {

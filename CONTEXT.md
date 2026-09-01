@@ -15,11 +15,11 @@ The provider-specific model name that replaces the Virtual Model in every upstre
 _Avoid_: Model, virtual model
 
 **Failover Failure**:
-A provider response or connection failure that permits retrying another provider and temporarily makes the failed provider unavailable. This includes HTTP `402`, HTTP `429`, HTTP `5xx`, timeouts, and network errors.
+A provider response or connection failure that permits retrying another provider and temporarily makes the failed provider unavailable. This includes HTTP `402`, HTTP `429`, HTTP `5xx`, timeouts, network errors, and an HTTP `400` whose error message names `reasoning_effort` as an unsupported value.
 _Avoid_: Any non-200 response, provider error
 
 **Client Error**:
-An HTTP `4xx` response other than `402` or `429` that is returned to the client unchanged and does not affect provider availability.
+An HTTP `4xx` response other than `402` or `429` that is returned to the client unchanged and does not affect provider availability. A `400` naming `reasoning_effort` as an unsupported value is a Failover Failure instead.
 _Avoid_: Provider failure
 
 **Cooldown**:
