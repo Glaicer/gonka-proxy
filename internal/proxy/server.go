@@ -748,6 +748,13 @@ func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias strin
 	for key, value := range payload {
 		forwardedPayload[key] = value
 	}
+	if tools, ok := forwardedPayload["tools"]; ok {
+		normalizedTools, err := normalizeTools(tools)
+		if err != nil {
+			return nil, fmt.Errorf("normalize tools: %w", err)
+		}
+		forwardedPayload["tools"] = normalizedTools
+	}
 	encodedModelAlias, err := json.Marshal(modelAlias)
 	if err != nil {
 		return nil, fmt.Errorf("encode model alias: %w", err)
@@ -763,6 +770,141 @@ func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias strin
 		delete(forwardedPayload, "reasoning_effort")
 	}
 	return json.Marshal(forwardedPayload)
+}
+
+// normalizeTools expands local JSON Schema references in function tool
+// parameters. Some OpenAI-compatible providers reject the standard $defs/$ref
+// form even though Goose and other clients use it for tool schemas.
+func normalizeTools(raw json.RawMessage) (json.RawMessage, error) {
+	var tools []any
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, fmt.Errorf("decode tools: %w", err)
+	}
+
+	for index, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		parameters, ok := function["parameters"].(map[string]any)
+		if !ok {
+			continue
+		}
+		expanded, err := expandSchemaNode(parameters, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("tool %d parameters: %w", index, err)
+		}
+		function["parameters"] = expanded
+	}
+
+	return json.Marshal(tools)
+}
+
+func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[string]bool) (any, error) {
+	switch node := value.(type) {
+	case []any:
+		for index, item := range node {
+			expanded, err := expandSchemaNode(item, inheritedDefs, resolving)
+			if err != nil {
+				return nil, err
+			}
+			node[index] = expanded
+		}
+		return node, nil
+	case map[string]any:
+		defs := inheritedDefs
+		if rawDefs, ok := node["$defs"].(map[string]any); ok {
+			defs = copyDefs(inheritedDefs)
+			for name, definition := range rawDefs {
+				defs[name] = definition
+			}
+			delete(node, "$defs")
+		}
+		if rawDefinitions, ok := node["definitions"].(map[string]any); ok {
+			defs = copyDefs(defs)
+			for name, definition := range rawDefinitions {
+				defs[name] = definition
+			}
+			delete(node, "definitions")
+		}
+
+		if ref, ok := node["$ref"].(string); ok {
+			name, isLocal := localSchemaReferenceName(ref)
+			if isLocal {
+				definition, found := defs[name]
+				if !found {
+					return nil, fmt.Errorf("unresolved local schema reference %q", ref)
+				}
+				if resolving == nil {
+					resolving = map[string]bool{}
+				}
+				if resolving[name] {
+					return nil, fmt.Errorf("cyclic local schema reference %q", ref)
+				}
+				resolving[name] = true
+				expandedDefinition, err := expandSchemaNode(cloneJSONValue(definition), defs, resolving)
+				delete(resolving, name)
+				if err != nil {
+					return nil, err
+				}
+				definitionMap, ok := expandedDefinition.(map[string]any)
+				if !ok {
+					return nil, fmt.Errorf("schema reference %q does not resolve to an object", ref)
+				}
+				for key, definitionValue := range definitionMap {
+					node[key] = definitionValue
+				}
+				delete(node, "$ref")
+			}
+		}
+
+		for key, child := range node {
+			expanded, err := expandSchemaNode(child, defs, resolving)
+			if err != nil {
+				return nil, err
+			}
+			node[key] = expanded
+		}
+		return node, nil
+	default:
+		return value, nil
+	}
+}
+
+func localSchemaReferenceName(ref string) (string, bool) {
+	const defsPrefix = "#/$defs/"
+	const definitionsPrefix = "#/definitions/"
+	if strings.HasPrefix(ref, defsPrefix) {
+		return strings.TrimPrefix(ref, defsPrefix), true
+	}
+	if strings.HasPrefix(ref, definitionsPrefix) {
+		return strings.TrimPrefix(ref, definitionsPrefix), true
+	}
+	return "", false
+}
+
+func copyDefs(defs map[string]any) map[string]any {
+	copy := make(map[string]any, len(defs)+1)
+	for name, definition := range defs {
+		copy[name] = definition
+	}
+	return copy
+}
+
+func cloneJSONValue(value any) any {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var cloned any
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return value
+	}
+	return cloned
 }
 
 func copyHeaders(destination, source http.Header) {

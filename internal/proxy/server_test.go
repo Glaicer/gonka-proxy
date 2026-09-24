@@ -2338,6 +2338,74 @@ func TestChatCompletionsOverwritesReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsExpandsToolSchemaDefinitions(t *testing.T) {
+	observation := make(chan []byte, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+			return
+		}
+		observation <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer provider.Close()
+
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       nil,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 10},
+		},
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requestBody := `{"model":"virtual-model","messages":[],"tools":[{"type":"function","function":{"name":"demo","parameters":{"type":"object","$defs":{"thing":{"type":"string","enum":["x"]}},"properties":{"value":{"$ref":"#/$defs/thing"}},"required":["value"]}}}]}`
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	_, _ = io.ReadAll(response.Body)
+
+	select {
+	case body := <-observation:
+		bodyText := string(body)
+		if strings.Contains(bodyText, "$defs") || strings.Contains(bodyText, "$ref") {
+			t.Fatalf("upstream body still contains unsupported schema references: %s", bodyText)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		tools, ok := payload["tools"].([]any)
+		if !ok || len(tools) != 1 {
+			t.Fatalf("upstream tools = %#v, want one tool", payload["tools"])
+		}
+		tool := tools[0].(map[string]any)
+		function := tool["function"].(map[string]any)
+		parameters := function["parameters"].(map[string]any)
+		properties := parameters["properties"].(map[string]any)
+		value := properties["value"].(map[string]any)
+		if value["type"] != "string" {
+			t.Errorf("expanded property type = %v, want string", value["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream observation")
+	}
+}
+
 func TestChatCompletionsAppliesPerProviderReasoningEffort(t *testing.T) {
 	tests := []struct {
 		name           string
