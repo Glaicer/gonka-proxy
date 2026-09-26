@@ -8,7 +8,7 @@ Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can ru
 
 - Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream.
 - Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
-- On a **402, 429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
+- On a **402, 429, 404 (optionally) or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
 - A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
 - Maps your **virtual model name** to each provider's real model, so clients don't need to know or care which upstream you're using.
 - Enforces one **reasoning effort** setting on every upstream request, with per-provider overrides for backends that don't support the parameter.
@@ -31,6 +31,7 @@ server:
 cooldown: 120s            # how long a failed provider is benched before retry
 recovery_wait: 30s        # wait before probing again when all providers are down
 response_header_timeout: 30s  # max time to wait for a provider's response headers
+failover_on_404: false    # set true to try another provider after any upstream 404
 log_level: WARN           # INFO, WARN (default), or ERROR
 
 reasoning_effort: xhigh   # required; see "Reasoning effort" below
@@ -49,6 +50,8 @@ providers:                # one block per upstream, higher priority = preferred
 ```
 
 List your providers in any order; Gonka always tries the **highest `priority` number first**. Equal priorities keep YAML declaration order. Add as many blocks as you like.
+
+Set `failover_on_404: true` to treat any provider HTTP 404 as a failover failure: the proxy tries the next available provider and places the one that returned 404 in cooldown. The default is `false`, which passes 404 responses back to the client unchanged.
 
 `log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
 
@@ -87,6 +90,7 @@ Values each provider currently accepts for DeepSeek V4 Flash 0731 model:
 | GonkaRouter    | OK  | OK     | OK   | OK    | OK  |
 | GonkaGate      | OK  | OK     | OK   | OK    | OK  |
 | Gonka-API      | OK  | OK     | OK   | OK    | OK  |
+
 
 **Note**: it seems that sometimes `reasoning_effort: max` support depends on devshard/node and might be unstable. Consider adding `reasoning_effort: high` fallbacks to your config.
 

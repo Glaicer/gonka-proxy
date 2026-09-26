@@ -736,6 +736,64 @@ func TestChatCompletionsReturnsOtherClientErrorsWithoutFailover(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsFailsOverOn404WhenEnabled(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"message":"model not found"}}`)
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	effort := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Minute,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &effort,
+		FailoverOn404:         true,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: primaryProvider.URL + "/v1", APIKey: "primary-secret", ModelAlias: "primary-model", Priority: 100},
+			{Name: "backup", BaseURL: backupProvider.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	for range 2 {
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK || string(body) != `{"provider":"backup"}` {
+			t.Fatalf("response = %d %s, want backup response", resp.StatusCode, body)
+		}
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary received %d requests, want 1 after cooldown", got)
+	}
+	if got := backupHits.Load(); got != 2 {
+		t.Fatalf("backup received %d requests, want 2", got)
+	}
+}
+
 func TestChatCompletionsFailsOverWithoutReadingStalledFailoverBody(t *testing.T) {
 	for _, statusCode := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusPaymentRequired} {
 		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {

@@ -48,6 +48,7 @@ type Server struct {
 	cooldownVersion  uint64
 	logger           Logger
 	logLevel         config.LogLevel
+	failoverOn404    bool
 }
 
 type provider struct {
@@ -112,8 +113,9 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
-		logger:   logger,
-		logLevel: logLevel,
+		logger:        logger,
+		logLevel:      logLevel,
+		failoverOn404: cfg.FailoverOn404,
 	}, nil
 }
 
@@ -228,7 +230,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			}
 
 			if upstreamResponse.StatusCode != http.StatusOK {
-				if isFailoverStatus(upstreamResponse.StatusCode) {
+				if isFailoverStatus(upstreamResponse.StatusCode) || (s.failoverOn404 && upstreamResponse.StatusCode == http.StatusNotFound) {
 					var errorMessage string
 					if s.payloadLoggingEnabled() {
 						responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
@@ -247,6 +249,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 						category = "payment-required"
 					case http.StatusTooManyRequests:
 						category = "rate-limit"
+					case http.StatusNotFound:
+						category = "not-found"
 					}
 					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 					continue

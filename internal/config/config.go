@@ -106,6 +106,7 @@ type Config struct {
 	ResponseHeaderTimeout time.Duration
 	LogLevel              LogLevel
 	ReasoningEffort       *ReasoningEffort
+	FailoverOn404         bool
 	Providers             []Provider
 }
 
@@ -130,6 +131,7 @@ type rawConfig struct {
 	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
 	LogLevel              string        `yaml:"log_level"`
 	ReasoningEffort       *string       `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
+	FailoverOn404         bool          `yaml:"failover_on_404"`
 	Providers             []rawProvider `yaml:"providers"`
 }
 
@@ -201,6 +203,7 @@ func Load(path string) (Config, error) {
 		ResponseHeaderTimeout: 0,
 		LogLevel:              LogLevel(DefaultLogLevel),
 		ReasoningEffort:       parsedReasoningEffort,
+		FailoverOn404:         raw.FailoverOn404,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 	}
 	if cfg.ListenAddress == "" {

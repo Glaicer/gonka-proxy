@@ -11,6 +11,9 @@ recovery_wait: 30s
 # Max time to wait for response headers from an upstream provider before timing out.
 response_header_timeout: 30s
 
+# Treat provider HTTP 404 responses as failover failures. Defaults to false.
+failover_on_404: false
+
 # Minimum log level to emit (INFO, WARN, or ERROR).
 # Defaults to WARN. INFO includes detailed lifecycle diagnostics (Provider
 # selection and successes, Cooldown and Recovery Wait transitions, and

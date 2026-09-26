@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,26 @@ providers:
 	}
 	if cfg.LogLevel != config.LogLevelWarn {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, config.LogLevelWarn)
+	}
+	if cfg.FailoverOn404 {
+		t.Error("FailoverOn404 = true, want false by default")
+	}
+}
+
+func TestLoadParsesFailoverOn404(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		cfg := loadConfig(t, fmt.Sprintf(`reasoning_effort: max
+failover_on_404: %t
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`, enabled))
+		if cfg.FailoverOn404 != enabled {
+			t.Errorf("FailoverOn404 = %t, want %t", cfg.FailoverOn404, enabled)
+		}
 	}
 }
 

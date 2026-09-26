@@ -12,7 +12,7 @@ Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root,
 
 Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
 
-When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, and `log_level` to `WARN`.
+When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, `failover_on_404` to `false`, and `log_level` to `WARN`.
 
 ## Docker Compose
 
