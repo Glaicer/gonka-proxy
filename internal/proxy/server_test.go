@@ -2644,3 +2644,91 @@ func assertRequestBody(t *testing.T, gotBody []byte, wantBody string, wantModelA
 func stringPtr(s string) *string { return &s }
 
 func effortPtr(e config.ReasoningEffort) *config.ReasoningEffort { return &e }
+
+func TestOwnErrorsReturnedAsOpenAIJSON(t *testing.T) {
+	// A provider is configured so the request reaches body parsing. A non-JSON
+	// body triggers the proxy's own 400, which must now be OpenAI-style JSON.
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	response, err := http.Post(
+		server.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`this is not json`),
+	)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+	body, _ := io.ReadAll(response.Body)
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("error body is not valid JSON: %v; body = %q", err, body)
+	}
+	if envelope.Error.Type != "invalid_request_error" || envelope.Error.Code != "invalid_json_body" {
+		t.Fatalf("error envelope = %#v, want type=invalid_request_error code=invalid_json_body", envelope.Error)
+	}
+	if envelope.Error.Message == "" {
+		t.Fatalf("error envelope has empty message: %#v", envelope.Error)
+	}
+}
+
+func TestMethodNotAllowedReturnedAsOpenAIJSON(t *testing.T) {
+	// A provider is configured so the request reaches the method check first.
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", response.StatusCode)
+	}
+	body, _ := io.ReadAll(response.Body)
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("error body is not valid JSON: %v; body = %q", err, body)
+	}
+	if envelope.Error.Type != "invalid_request_error" || envelope.Error.Code != "method_not_allowed" {
+		t.Fatalf("error envelope = %#v, want type=invalid_request_error code=method_not_allowed", envelope.Error)
+	}
+}

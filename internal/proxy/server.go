@@ -149,11 +149,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeOpenAIError(w, "method not allowed", http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed")
 		return
 	}
 	if len(s.providers) == 0 {
-		http.Error(w, "no Providers configured", http.StatusServiceUnavailable)
+		writeOpenAIError(w, "No Providers configured", http.StatusServiceUnavailable, "server_error", "no_providers_configured")
 		return
 	}
 
@@ -163,18 +163,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.logCancellation("request-body")
 			return
 		}
-		http.Error(w, "could not read request body", http.StatusBadRequest)
+		writeOpenAIError(w, "could not read request body", http.StatusBadRequest, "invalid_request_error", "request_read_error")
 		return
 	}
 	defer r.Body.Close()
 
 	payload, err := decodeRequestBody(body)
 	if err != nil {
-		http.Error(w, "request body must be a JSON object", http.StatusBadRequest)
+		writeOpenAIError(w, "request body must be a JSON object", http.StatusBadRequest, "invalid_request_error", "invalid_json_body")
 		return
 	}
 
 	s.route(w, r, payload)
+}
+
+// openAIErrorResponse mirrors the error envelope used by the OpenAI API. The
+// proxy answers with this shape (instead of plain text) so OpenAI-compatible
+// clients such as Goose and forge can parse the failure instead of treating the
+// body as opaque text. The HTTP status code is preserved, so the failover
+// contract is unchanged.
+type openAIErrorResponse struct {
+	Error openAIError `json:"error"`
+}
+
+type openAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
+
+func writeOpenAIError(w http.ResponseWriter, message string, statusCode int, errorType, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(openAIErrorResponse{
+		Error: openAIError{
+			Message: message,
+			Type:    errorType,
+			Code:    code,
+		},
+	})
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
@@ -197,7 +224,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
 			if err != nil {
-				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
+				writeOpenAIError(w, "could not encode upstream request", http.StatusBadGateway, "server_error", "upstream_encode_error")
 				return
 			}
 
@@ -208,7 +235,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				bytes.NewReader(upstreamBody),
 			)
 			if err != nil {
-				http.Error(w, "could not create upstream request", http.StatusBadGateway)
+				writeOpenAIError(w, "could not create upstream request", http.StatusBadGateway, "server_error", "upstream_request_error")
 				return
 			}
 			copyHeaders(upstreamRequest.Header, r.Header)
