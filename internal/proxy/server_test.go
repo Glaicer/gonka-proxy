@@ -916,6 +916,135 @@ func TestChatCompletionsFailsOverOnServerErrors(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsFailsOverOnEmptyCompletion(t *testing.T) {
+	cases := []struct {
+		name        string
+		primaryBody string
+	}{
+		{
+			name:        "empty_choices_array",
+			primaryBody: `{"choices":[],"usage":{"total_tokens":0}}`,
+		},
+		{
+			name:        "empty_content_no_finish_reason",
+			primaryBody: `{"choices":[{"message":{"role":"assistant","content":""}}]}`,
+		},
+		{
+			name:        "no_message_no_finish_reason",
+			primaryBody: `{"choices":[{"index":0,"logprobs":null}]}`,
+		},
+		{
+			name:        "null_finish_reason_empty_message",
+			primaryBody: `{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":null}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var primaryHits atomic.Int32
+			var backupHits atomic.Int32
+
+			primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.primaryBody)
+			}))
+			defer primaryProvider.Close()
+
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"fallback answer"},"finish_reason":"stop"}]}`)
+			}))
+			defer backupProvider.Close()
+
+			server := newProxyServer(t, []providerFixture{
+				{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+				{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+			})
+			defer server.Close()
+
+			for requestNumber := 0; requestNumber < 2; requestNumber++ {
+				resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+				if err != nil {
+					t.Fatalf("proxy request: %v", err)
+				}
+				responseBody, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err != nil {
+					t.Fatalf("read response body: %v", err)
+				}
+				// The client must never see the provider's empty completion: it gets
+				// a usable completion from the backup provider instead.
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("request %d status = %d, want %d (empty completion leaked)", requestNumber+1, resp.StatusCode, http.StatusOK)
+				}
+				if strings.Contains(string(responseBody), "fallback answer") == false {
+					t.Fatalf("request %d body = %s, want backup response", requestNumber+1, responseBody)
+				}
+			}
+
+			if got := primaryHits.Load(); got != 1 {
+				t.Fatalf("primary Provider received %d requests, want 1 (second request must skip it via cooldown)", got)
+			}
+			if got := backupHits.Load(); got != 2 {
+				t.Fatalf("backup Provider received %d requests, want 2", got)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsForwardsValidCompletionWithoutFailover(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"backup"},"finish_reason":"stop"}]}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	for requestNumber := 0; requestNumber < 2; requestNumber++ {
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		responseBody, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want %d", requestNumber+1, resp.StatusCode, http.StatusOK)
+		}
+		// A real completion must be forwarded as-is from the primary, no failover.
+		if strings.Contains(string(responseBody), "hello") == false {
+			t.Fatalf("request %d body = %s, want primary completion", requestNumber+1, responseBody)
+		}
+	}
+
+	if got := primaryHits.Load(); got != 2 {
+		t.Fatalf("primary Provider received %d requests, want 2 (valid completions must not fail over)", got)
+	}
+	if got := backupHits.Load(); got != 0 {
+		t.Fatalf("backup Provider received %d requests, want 0", got)
+	}
+}
+
 func TestChatCompletionsFailsOverOnNetworkFailure(t *testing.T) {
 	var failedProviderHits atomic.Int32
 	var backupProviderHits atomic.Int32
