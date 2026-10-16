@@ -319,6 +319,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 			responseBody, readErr := io.ReadAll(upstreamResponse.Body)
 			if readErr != nil {
+				if r.Context().Err() != nil {
+					s.logCancellation("upstream-body")
+					return
+				}
 				s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
 				continue
 			}
