@@ -72,6 +72,49 @@ func TestChatCompletionsPreservesToolReferenceConstraints(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsReportsInvalidToolReferences(t *testing.T) {
+	for _, tc := range []struct{ name, parameters, diagnosis, ref string }{
+		{"unresolved", `{"properties":{"value":{"$ref":"#/$defs/Missing"}}}`, "unresolved", "#/$defs/Missing"},
+		{"cyclic", `{"$defs":{"Node":{"$ref":"#/$defs/Node"}},"properties":{"value":{"$ref":"#/$defs/Node"}}}`, "cyclic", "#/$defs/Node"},
+		{"indirect_cycle", `{"$defs":{"A":{"$ref":"#/definitions/B"}},"definitions":{"B":{"$ref":"#/$defs/A"}},"properties":{"value":{"$ref":"#/$defs/A"}}}`, "cyclic", "#/$defs/A"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("invalid schema reached upstream")
+			}))
+			defer upstream.Close()
+			server := newProxyServer(t, []providerFixture{
+				{baseURL: upstream.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+			})
+			defer server.Close()
+			requestBody := `{"messages":[],"tools":[{"type":"function","function":{"name":"demo","parameters":` + tc.parameters + `}}]}`
+			response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(requestBody))
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer response.Body.Close()
+			var envelope struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if response.StatusCode != http.StatusBadGateway || envelope.Error.Type != "server_error" || envelope.Error.Code != "upstream_encode_error" {
+				t.Fatalf("unexpected error response: status=%d envelope=%+v", response.StatusCode, envelope)
+			}
+			for _, want := range []string{"tool 0 parameters", tc.diagnosis, tc.ref} {
+				if !strings.Contains(envelope.Error.Message, want) {
+					t.Errorf("message = %q, want %q", envelope.Error.Message, want)
+				}
+			}
+		})
+	}
+}
+
 func assertUpstreamToolParameters(t *testing.T, parameters, wantParameters string) {
 	t.Helper()
 	observations := make(chan []byte, 1)

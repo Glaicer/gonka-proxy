@@ -226,7 +226,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
 			if err != nil {
-				writeOpenAIError(w, "could not encode upstream request", http.StatusBadGateway, "server_error", "upstream_encode_error")
+				writeOpenAIError(w, fmt.Sprintf("could not encode upstream request: %v", err), http.StatusBadGateway, "server_error", "upstream_encode_error")
 				return
 			}
 
