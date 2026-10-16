@@ -59,6 +59,19 @@ func TestChatCompletionsResolvesToolSchemaPointers(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsPreservesToolReferenceConstraints(t *testing.T) {
+	for _, tc := range []struct{ name, parameters, want string }{
+		{"conflicting_limits", `{"type":"object","$defs":{"Text":{"type":"string","maxLength":10}},"properties":{"value":{"$ref":"#/$defs/Text","maxLength":1}}}`, `{"type":"object","properties":{"value":{"maxLength":1,"allOf":[{"type":"string","maxLength":10}]}}}`},
+		{"existing_allOf", `{"type":"object","$defs":{"Text":{"type":"string"}},"properties":{"value":{"$ref":"#/$defs/Text","allOf":[{"minLength":1}]}}}`, `{"type":"object","properties":{"value":{"allOf":[{"minLength":1},{"type":"string"}]}}}`},
+		{"separate_property_scopes", `{"type":"object","$defs":{"Closed":{"type":"object","properties":{"x":{"type":"string"}},"additionalProperties":false}},"properties":{"value":{"$ref":"#/$defs/Closed","properties":{"y":{"type":"string"}}}}}`, `{"type":"object","properties":{"value":{"properties":{"y":{"type":"string"}},"allOf":[{"type":"object","properties":{"x":{"type":"string"}},"additionalProperties":false}]}}}`},
+		{"boolean_definition", `{"type":"object","$defs":{"Allowed":true},"properties":{"value":{"$ref":"#/$defs/Allowed"}}}`, `{"type":"object","properties":{"value":true}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertUpstreamToolParameters(t, tc.parameters, tc.want)
+		})
+	}
+}
+
 func assertUpstreamToolParameters(t *testing.T, parameters, wantParameters string) {
 	t.Helper()
 	observations := make(chan []byte, 1)

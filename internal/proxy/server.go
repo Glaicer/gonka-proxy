@@ -972,14 +972,17 @@ func expandSchemaNode(value any, rootSchema map[string]any, resolving map[string
 				if err != nil {
 					return nil, err
 				}
-				definitionMap, ok := expandedDefinition.(map[string]any)
-				if !ok {
-					return nil, fmt.Errorf("schema reference %q does not resolve to an object", ref)
-				}
-				for key, definitionValue := range definitionMap {
-					node[key] = definitionValue
+				switch expandedDefinition.(type) {
+				case map[string]any, bool:
+				default:
+					return nil, fmt.Errorf("schema reference %q does not resolve to a schema", ref)
 				}
 				delete(node, "$ref")
+				if len(node) == 0 {
+					return expandedDefinition, nil
+				}
+				constraints, _ := node["allOf"].([]any)
+				node["allOf"] = append(constraints, expandedDefinition)
 			}
 		}
 
