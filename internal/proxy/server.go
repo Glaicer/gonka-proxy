@@ -912,7 +912,9 @@ func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias strin
 // form even though Goose and other clients use it for tool schemas.
 func normalizeTools(raw json.RawMessage) (json.RawMessage, error) {
 	var tools []any
-	if err := json.Unmarshal(raw, &tools); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&tools); err != nil {
 		return nil, fmt.Errorf("decode tools: %w", err)
 	}
 
@@ -1036,7 +1038,9 @@ func cloneJSONValue(value any) any {
 		return value
 	}
 	var cloned any
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&cloned); err != nil {
 		return value
 	}
 	return cloned
