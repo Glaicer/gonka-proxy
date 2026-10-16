@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -931,7 +932,7 @@ func normalizeTools(raw json.RawMessage) (json.RawMessage, error) {
 		if !ok {
 			continue
 		}
-		expanded, err := expandSchemaNode(parameters, nil, nil)
+		expanded, err := expandSchemaNode(cloneJSONValue(parameters), parameters, make(map[string]bool))
 		if err != nil {
 			return nil, fmt.Errorf("tool %d parameters: %w", index, err)
 		}
@@ -941,11 +942,11 @@ func normalizeTools(raw json.RawMessage) (json.RawMessage, error) {
 	return json.Marshal(tools)
 }
 
-func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[string]bool) (any, error) {
+func expandSchemaNode(value any, rootSchema map[string]any, resolving map[string]bool) (any, error) {
 	switch node := value.(type) {
 	case []any:
 		for index, item := range node {
-			expanded, err := expandSchemaNode(item, inheritedDefs, resolving)
+			expanded, err := expandSchemaNode(item, rootSchema, resolving)
 			if err != nil {
 				return nil, err
 			}
@@ -953,38 +954,21 @@ func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[str
 		}
 		return node, nil
 	case map[string]any:
-		defs := inheritedDefs
-		if rawDefs, ok := node["$defs"].(map[string]any); ok {
-			defs = copyDefs(inheritedDefs)
-			for name, definition := range rawDefs {
-				defs[name] = definition
-			}
-			delete(node, "$defs")
-		}
-		if rawDefinitions, ok := node["definitions"].(map[string]any); ok {
-			defs = copyDefs(defs)
-			for name, definition := range rawDefinitions {
-				defs[name] = definition
-			}
-			delete(node, "definitions")
-		}
+		delete(node, "$defs")
+		delete(node, "definitions")
 
 		if ref, ok := node["$ref"].(string); ok {
-			name, isLocal := localSchemaReferenceName(ref)
-			if isLocal {
-				definition, found := defs[name]
-				if !found {
-					return nil, fmt.Errorf("unresolved local schema reference %q", ref)
+			if strings.HasPrefix(ref, "#/$defs/") || strings.HasPrefix(ref, "#/definitions/") {
+				definition, err := resolveSchemaReference(rootSchema, ref)
+				if err != nil {
+					return nil, err
 				}
-				if resolving == nil {
-					resolving = map[string]bool{}
-				}
-				if resolving[name] {
+				if resolving[ref] {
 					return nil, fmt.Errorf("cyclic local schema reference %q", ref)
 				}
-				resolving[name] = true
-				expandedDefinition, err := expandSchemaNode(cloneJSONValue(definition), defs, resolving)
-				delete(resolving, name)
+				resolving[ref] = true
+				expandedDefinition, err := expandSchemaNode(cloneJSONValue(definition), rootSchema, resolving)
+				delete(resolving, ref)
 				if err != nil {
 					return nil, err
 				}
@@ -1007,7 +991,7 @@ func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[str
 					continue
 				}
 				for name, schema := range schemas {
-					expanded, err := expandSchemaNode(schema, defs, resolving)
+					expanded, err := expandSchemaNode(schema, rootSchema, resolving)
 					if err != nil {
 						return nil, err
 					}
@@ -1016,7 +1000,7 @@ func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[str
 			case "items", "prefixItems", "additionalItems", "contains", "unevaluatedItems",
 				"additionalProperties", "unevaluatedProperties", "propertyNames", "contentSchema",
 				"allOf", "anyOf", "oneOf", "not", "if", "then", "else":
-				expanded, err := expandSchemaNode(child, defs, resolving)
+				expanded, err := expandSchemaNode(child, rootSchema, resolving)
 				if err != nil {
 					return nil, err
 				}
@@ -1029,24 +1013,32 @@ func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[str
 	}
 }
 
-func localSchemaReferenceName(ref string) (string, bool) {
-	const defsPrefix = "#/$defs/"
-	const definitionsPrefix = "#/definitions/"
-	if strings.HasPrefix(ref, defsPrefix) {
-		return strings.TrimPrefix(ref, defsPrefix), true
+func resolveSchemaReference(rootSchema map[string]any, ref string) (any, error) {
+	pointer, err := url.PathUnescape(strings.TrimPrefix(ref, "#/"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid local schema reference %q: %w", ref, err)
 	}
-	if strings.HasPrefix(ref, definitionsPrefix) {
-		return strings.TrimPrefix(ref, definitionsPrefix), true
+	var value any = rootSchema
+	for _, token := range strings.Split(pointer, "/") {
+		name := strings.ReplaceAll(strings.ReplaceAll(token, "~1", "/"), "~0", "~")
+		switch node := value.(type) {
+		case map[string]any:
+			var found bool
+			value, found = node[name]
+			if !found {
+				return nil, fmt.Errorf("unresolved local schema reference %q", ref)
+			}
+		case []any:
+			index, err := strconv.Atoi(name)
+			if err != nil || index < 0 || index >= len(node) {
+				return nil, fmt.Errorf("unresolved local schema reference %q", ref)
+			}
+			value = node[index]
+		default:
+			return nil, fmt.Errorf("unresolved local schema reference %q", ref)
+		}
 	}
-	return "", false
-}
-
-func copyDefs(defs map[string]any) map[string]any {
-	copy := make(map[string]any, len(defs)+1)
-	for name, definition := range defs {
-		copy[name] = definition
-	}
-	return copy
+	return value, nil
 }
 
 func cloneJSONValue(value any) any {

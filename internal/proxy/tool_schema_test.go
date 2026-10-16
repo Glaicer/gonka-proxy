@@ -43,6 +43,22 @@ func TestChatCompletionsExpandsNestedToolSchemas(t *testing.T) {
 		`{"type":"object","properties":{"items":{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"null"}]}}},"additionalProperties":{"type":"string"}}`)
 }
 
+func TestChatCompletionsResolvesToolSchemaPointers(t *testing.T) {
+	for _, tc := range []struct{ name, parameters, want string }{
+		{"namespaces", `{"type":"object","$defs":{"X":{"type":"string"}},"definitions":{"X":{"type":"integer"}},"properties":{"new":{"$ref":"#/$defs/X"},"old":{"$ref":"#/definitions/X"}}}`, `{"type":"object","properties":{"new":{"type":"string"},"old":{"type":"integer"}}}`},
+		{"escaped_tokens", `{"type":"object","$defs":{"a/b~c":{"type":"string"}},"properties":{"value":{"$ref":"#/$defs/a~1b~0c"}}}`, `{"type":"object","properties":{"value":{"type":"string"}}}`},
+		{"percent_encoding", `{"type":"object","$defs":{"a b":{"type":"string"}},"properties":{"value":{"$ref":"#/$defs/a%20b"}}}`, `{"type":"object","properties":{"value":{"type":"string"}}}`},
+		{"nested_pointer", `{"type":"object","$defs":{"Item":{"properties":{"name":{"type":"string"}}}},"properties":{"value":{"$ref":"#/$defs/Item/properties/name"}}}`, `{"type":"object","properties":{"value":{"type":"string"}}}`},
+		{"array_pointer", `{"type":"object","$defs":{"Item":{"anyOf":[{"type":"string"}]}},"properties":{"value":{"$ref":"#/$defs/Item/anyOf/0"}}}`, `{"type":"object","properties":{"value":{"type":"string"}}}`},
+		{"root_scope", `{"type":"object","$defs":{"X":{"type":"string"}},"properties":{"value":{"$defs":{"X":{"type":"integer"}},"$ref":"#/$defs/X"}}}`, `{"type":"object","properties":{"value":{"type":"string"}}}`},
+		{"reused_chain", `{"type":"object","$defs":{"X":{"$ref":"#/$defs/Y"},"Y":{"type":"string"}},"properties":{"a":{"$ref":"#/$defs/X"},"b":{"$ref":"#/$defs/X"}}}`, `{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertUpstreamToolParameters(t, tc.parameters, tc.want)
+		})
+	}
+}
+
 func assertUpstreamToolParameters(t *testing.T, parameters, wantParameters string) {
 	t.Helper()
 	observations := make(chan []byte, 1)
