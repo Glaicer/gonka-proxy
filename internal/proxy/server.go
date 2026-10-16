@@ -768,13 +768,13 @@ func containsUnsupportedReasoningEffort(message string) bool {
 }
 
 // emptyChoiceFinishReasons are the OpenAI finish reasons that carry an actual
-// completion. Anything else (absent, null, "", or an arbitrary string) means
-// the provider returned no usable result and a client would reject the turn.
+// completion.
 var emptyChoiceFinishReasons = map[string]struct{}{
 	"stop":           {},
 	"tool_calls":     {},
 	"length":         {},
 	"content_filter": {},
+	"function_call":  {},
 }
 
 // isEmptyCompletion reports whether a 200 response body is a structurally
@@ -833,8 +833,7 @@ func isEmptyCompletion(responseBody []byte) bool {
 		return false
 	}
 
-	hasFinishReason := choice.FinishReason != nil
-	if hasFinishReason {
+	if choice.FinishReason != nil {
 		if _, ok := emptyChoiceFinishReasons[*choice.FinishReason]; ok {
 			return false
 		}
@@ -846,7 +845,7 @@ func isEmptyCompletion(responseBody []byte) bool {
 	}
 	if message == nil {
 		// A choice with no message and no valid finish reason is empty.
-		return !hasFinishReason
+		return true
 	}
 	if message.Content != nil && strings.TrimSpace(*message.Content) != "" {
 		return false
@@ -857,7 +856,7 @@ func isEmptyCompletion(responseBody []byte) bool {
 			return false
 		}
 	}
-	return !hasFinishReason
+	return true
 }
 
 func chatCompletionsURL(baseURL string) (string, error) {
