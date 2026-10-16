@@ -1000,11 +1000,28 @@ func expandSchemaNode(value any, inheritedDefs map[string]any, resolving map[str
 		}
 
 		for key, child := range node {
-			expanded, err := expandSchemaNode(child, defs, resolving)
-			if err != nil {
-				return nil, err
+			switch key {
+			case "properties", "patternProperties", "dependentSchemas", "dependencies":
+				schemas, ok := child.(map[string]any)
+				if !ok {
+					continue
+				}
+				for name, schema := range schemas {
+					expanded, err := expandSchemaNode(schema, defs, resolving)
+					if err != nil {
+						return nil, err
+					}
+					schemas[name] = expanded
+				}
+			case "items", "prefixItems", "additionalItems", "contains", "unevaluatedItems",
+				"additionalProperties", "unevaluatedProperties", "propertyNames", "contentSchema",
+				"allOf", "anyOf", "oneOf", "not", "if", "then", "else":
+				expanded, err := expandSchemaNode(child, defs, resolving)
+				if err != nil {
+					return nil, err
+				}
+				node[key] = expanded
 			}
-			node[key] = expanded
 		}
 		return node, nil
 	default:

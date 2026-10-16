@@ -26,6 +26,23 @@ func TestChatCompletionsPreservesToolSchemaNumbers(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsPreservesToolSchemaData(t *testing.T) {
+	for _, tc := range []struct{ name, parameters string }{
+		{"property_names", `{"type":"object","properties":{"definitions":{"type":"object"},"$defs":{"type":"string"},"$ref":{"type":"string"}},"required":["definitions"]}`},
+		{"literal_values", `{"type":"object","properties":{"value":{"type":"object","default":{"$ref":"#/$defs/missing"},"examples":[{"definitions":{"x":1}}],"const":{"$defs":{"x":2}}}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertUpstreamToolParameters(t, tc.parameters, tc.parameters)
+		})
+	}
+}
+
+func TestChatCompletionsExpandsNestedToolSchemas(t *testing.T) {
+	assertUpstreamToolParameters(t,
+		`{"type":"object","$defs":{"Text":{"type":"string"}},"properties":{"items":{"type":"array","items":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]}}},"additionalProperties":{"$ref":"#/$defs/Text"}}`,
+		`{"type":"object","properties":{"items":{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"null"}]}}},"additionalProperties":{"type":"string"}}`)
+}
+
 func assertUpstreamToolParameters(t *testing.T, parameters, wantParameters string) {
 	t.Helper()
 	observations := make(chan []byte, 1)
