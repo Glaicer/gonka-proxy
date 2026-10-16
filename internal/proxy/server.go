@@ -19,6 +19,7 @@ import (
 )
 
 const chatCompletionsPath = "/v1/chat/completions"
+const emptyCompletionCategory = "empty-completion"
 
 const (
 	maxLoggedErrorMessageLength = 512
@@ -308,13 +309,27 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 			streaming := isStreamingResponse(upstreamResponse, payload)
 			defer upstreamResponse.Body.Close()
-			copyHeaders(w.Header(), upstreamResponse.Header)
-			w.WriteHeader(upstreamResponse.StatusCode)
 			if streaming {
+				copyHeaders(w.Header(), upstreamResponse.Header)
+				w.WriteHeader(upstreamResponse.StatusCode)
 				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
 				return
 			}
-			_, _ = io.Copy(w, upstreamResponse.Body)
+
+			responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+			if readErr != nil {
+				s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
+				continue
+			}
+
+			if isEmptyCompletion(responseBody) {
+				s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
+				continue
+			}
+
+			copyHeaders(w.Header(), upstreamResponse.Header)
+			w.WriteHeader(upstreamResponse.StatusCode)
+			_, _ = w.Write(responseBody)
 			return
 		}
 
@@ -749,6 +764,99 @@ func isReasoningEffortUnsupportedError(statusCode int, errorMessage string, resp
 func containsUnsupportedReasoningEffort(message string) bool {
 	lowered := strings.ToLower(message)
 	return strings.Contains(lowered, "reasoning_effort") && strings.Contains(lowered, "unsupported value")
+}
+
+// emptyChoiceFinishReasons are the OpenAI finish reasons that carry an actual
+// completion. Anything else (absent, null, "", or an arbitrary string) means
+// the provider returned no usable result and a client would reject the turn.
+var emptyChoiceFinishReasons = map[string]struct{}{
+	"stop":           {},
+	"tool_calls":     {},
+	"length":         {},
+	"content_filter": {},
+}
+
+// isEmptyCompletion reports whether a 200 response body is a structurally
+// OpenAI-compatible completion that carries no usable result: it has a
+// "choices" key whose array is empty, or whose first choice has neither a
+// non-empty content, nor tool calls, nor a valid finish reason.
+//
+// Clients such as Forge reject such a response with "Empty completion received
+// - no content, tool calls, or valid finish reason" and retry by themselves,
+// which is exactly the per-request retry the proxy is meant to hide behind
+// failover. A provider answering 200 with an empty completion is broken for
+// this route right now, so it is a Failover Failure: the proxy hides it,
+// routes to the next provider, and puts the empty one in cooldown.
+//
+// Bodies without a "choices" key (synthetic or non-OpenAI responses) are left
+// untouched: the caller does not know the client's contract for those, so it
+// forwards them unchanged just as before.
+func isEmptyCompletion(responseBody []byte) bool {
+	if len(bytes.TrimSpace(responseBody)) == 0 {
+		return false
+	}
+	var payload struct {
+		Choices json.RawMessage `json:"choices"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return false
+	}
+	if len(payload.Choices) == 0 || string(payload.Choices) == "null" {
+		return false
+	}
+
+	var choices []json.RawMessage
+	if err := json.Unmarshal(payload.Choices, &choices); err != nil {
+		// A non-array "choices" (e.g. null) is not an OpenAI completion we can
+		// reason about; leave it untouched.
+		return false
+	}
+	if len(choices) == 0 {
+		return true
+	}
+
+	var choice struct {
+		FinishReason *string `json:"finish_reason"`
+		Message      *struct {
+			Content   *string         `json:"content"`
+			ToolCalls json.RawMessage `json:"tool_calls"`
+		} `json:"message"`
+		Delta *struct {
+			Content   *string         `json:"content"`
+			ToolCalls json.RawMessage `json:"tool_calls"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal(choices[0], &choice); err != nil {
+		// A choice we cannot parse is not something we can call "empty" with
+		// confidence; forward it unchanged.
+		return false
+	}
+
+	hasFinishReason := choice.FinishReason != nil
+	if hasFinishReason {
+		if _, ok := emptyChoiceFinishReasons[*choice.FinishReason]; ok {
+			return false
+		}
+	}
+
+	message := choice.Message
+	if message == nil {
+		message = choice.Delta
+	}
+	if message == nil {
+		// A choice with no message and no valid finish reason is empty.
+		return !hasFinishReason
+	}
+	if message.Content != nil && strings.TrimSpace(*message.Content) != "" {
+		return false
+	}
+	if rawToolCalls := message.ToolCalls; len(rawToolCalls) > 0 && string(rawToolCalls) != "null" {
+		var toolCalls []json.RawMessage
+		if json.Unmarshal(rawToolCalls, &toolCalls) == nil && len(toolCalls) > 0 {
+			return false
+		}
+	}
+	return !hasFinishReason
 }
 
 func chatCompletionsURL(baseURL string) (string, error) {
