@@ -300,6 +300,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					continue
 				}
 
+				if failoverClientStatus(upstreamResponse.StatusCode, responseBody) {
+					s.handleFailoverFailure(selected, "auth-disabled", upstreamResponse.StatusCode)
+					continue
+				}
+
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
@@ -769,6 +774,52 @@ func isReasoningEffortUnsupportedError(statusCode int, errorMessage string, resp
 func containsUnsupportedReasoningEffort(message string) bool {
 	lowered := strings.ToLower(message)
 	return strings.Contains(lowered, "reasoning_effort") && strings.Contains(lowered, "unsupported value")
+}
+
+// failoverClientStatus distinguishes the provider-own-key-disabled case from a
+// genuine client-side auth error. The request itself is fine and the fault is
+// not the client's: the provider's API key is paused or access is disabled.
+//
+// Providers answer those with HTTP 401 (some with 403) and a body like
+// {"error":{"message":"API key is paused or access disabled. Check its status:
+// https://app.gonkabroker.com/api-keys","type":"invalid_request_error",
+// "code":"invalid_api_key"}}. Brokers running LiteLLM phrase it as
+// {"error":{"message":"Authentication Error, Key is blocked. Update via
+// `/key/unblock` if you're an admin.","type":"auth_error","code":"401"}}.
+// Such a response can never succeed on the same provider no matter how often
+// it is retried, so it is a Failover Failure like a 402 rather than a Client
+// Error the end user should see: the proxy hides it, routes around the
+// disabled provider, and puts it in cooldown.
+//
+// A 401/403 without that hint stays a Client Error and is returned to the
+// client unchanged, because only the client knows whether its own request was
+// authorized; blanket-failing every 401/403 would leak nothing but would also
+// swallow genuine client-side auth errors. Only the status and the raw
+// response body are consulted; the caller passes the full body it already
+// read and the decision never depends on the log level.
+func failoverClientStatus(statusCode int, responseBody []byte) bool {
+	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		return false
+	}
+	lowered := bytes.ToLower(responseBody)
+	hints := []string{
+		"api key is paused or access disabled",
+		"api key is paused",
+		"access disabled",
+		"key is disabled",
+		"api key disabled",
+		"key has been paused",
+		"key paused",
+		"key is blocked",
+		"key blocked",
+		"key has been blocked",
+	}
+	for _, candidate := range hints {
+		if bytes.Contains(lowered, []byte(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 // emptyChoiceFinishReasons are the OpenAI finish reasons that carry an actual
