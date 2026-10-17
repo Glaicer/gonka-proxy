@@ -10,7 +10,7 @@ Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can ru
 - Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
 - On a **402, 429, 404 (optionally) or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
 - A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
-- Maps your **virtual model name** to each provider's real model, so clients don't need to know or care which upstream you're using.
+- Maps one or more **virtual model names** to each provider's real model, so clients don't need to know or care which upstream you're using.
 - Enforces one **reasoning effort** setting on every upstream request, with per-provider overrides for backends that don't support the parameter.
 
 ## Configuration
@@ -54,6 +54,60 @@ List your providers in any order; Gonka always tries the **highest `priority` nu
 Set `failover_on_404: true` to treat any provider HTTP 404 as a failover failure: the proxy tries the next available provider and places the one that returned 404 in cooldown. The default is `false`, which passes 404 responses back to the client unchanged.
 
 `log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
+
+### Multiple Virtual Models
+
+For new configurations, define Provider aliases by Virtual Model and declare the Model Route order explicitly:
+
+```yaml
+providers:
+  - name: gonka24
+    base_url: https://provider.example/v1
+    api_key: your-key
+    model_aliases:
+      gonka: deepseek-v4-flash-0731
+      deepseek-v4-flash-0731: deepseek-v4-flash-0731
+    priority: 100
+  - name: easy-gonka
+    base_url: https://backup.example/v1
+    api_key: your-key
+    model_aliases:
+      glm-5.3-flash: glm-5.3-flash
+    priority: 50
+
+model_routes:
+  gonka:
+    providers: [gonka24]
+  deepseek-v4-flash-0731:
+    providers: [gonka24]
+  glm-5.3-flash:
+    providers: [easy-gonka]
+```
+
+The request's `model` selects a Model Route. A missing `model` selects `gonka`; an unknown model returns `404` when `model_routes` is configured. A legacy configuration containing only scalar `model_alias` values continues to route through `gonka` and retains the previous behavior.
+
+Agents can discover the configured Virtual Models through the OpenAI-compatible endpoint:
+
+```sh
+curl http://127.0.0.1:58081/v1/models
+```
+
+It returns route IDs in configuration order with stable `model` metadata. Provider URLs, credentials, upstream aliases, and temporary Provider health are not exposed.
+
+#### Route fallbacks
+
+A route may point at another route to retry when all its providers fail (server error, cooldown, or blocked/paused key):
+
+```yaml
+model_routes:
+  gonka:
+    providers: [gonka24]
+  glm-5.3-flash:
+    providers: [easy-gonka]
+    fallback: gonka   # if easy-gonka fails, retry on the gonka route
+```
+
+Fallback chains are allowed (`fallback` → `fallback`), and cycles or unknown route references are rejected at startup with an actionable error.
 
 ## Reasoning effort
 
