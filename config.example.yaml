@@ -56,6 +56,11 @@ providers:
 # provider list is ordered explicitly; omit it to use global priority order.
 # Providers without an alias for a route are skipped.
 #
+# A route may declare `fallback: <other-route>`: when every provider on the
+# route fails (server error, cooldown, blocked key), the request retries on
+# the fallback route. Fallbacks are validated for unknown references and
+# cycles; chains (route -> fallback -> fallback) are allowed.
+#
 # providers:
 #   - name: primary
 #     base_url: https://provider.example/v1
@@ -69,3 +74,6 @@ providers:
 #     providers: [primary]
 #   deepseek-v4-flash-0731:
 #     providers: [primary]
+#   fallback-model:
+#     providers: [secondary]
+#     fallback: gonka

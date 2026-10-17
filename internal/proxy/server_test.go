@@ -549,6 +549,109 @@ func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsUsesFallbackRoute(t *testing.T) {
+	var primaryHits atomic.Int32
+	var fallbackHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"fallback"}`)
+	}))
+	defer fallback.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: primary.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "primary-model"}, Priority: 100},
+			{Name: "fallback", BaseURL: fallback.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "fallback-model"}, Priority: 50},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"fallback"}` {
+		t.Fatalf("response = (%d, %s), want fallback success", response.StatusCode, body)
+	}
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (1, 1)", primaryHits.Load(), fallbackHits.Load())
+	}
+}
+
+func TestChatCompletionsReturnsFinalFailureAfterFallbackChain(t *testing.T) {
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: firstProvider.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "model-a"}, Priority: 2},
+			{Name: "fallback", BaseURL: secondProvider.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "model-b"}, Priority: 1},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("response status = %d, want 502 (final failure after fallback chain)", response.StatusCode)
+	}
+	_ = body
+}
+
 func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
 	reasoningMax := config.ReasoningEffortMax
 	handler, err := proxy.New(config.Config{

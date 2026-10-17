@@ -125,6 +125,85 @@ model_routes:
 	}
 }
 
+func TestLoadRejectsInvalidFallbacks(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "unknown fallback",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases: {gonka: upstream}
+    priority: 10
+model_routes:
+  gonka:
+    providers: [primary]
+    fallback: missing
+`,
+			want: `model_routes["gonka"].fallback references unknown model route "missing"`,
+		},
+		{
+			name: "fallback cycle",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases: {first: upstream, second: upstream}
+    priority: 10
+model_routes:
+  first:
+    providers: [primary]
+    fallback: second
+  second:
+    providers: [primary]
+    fallback: first
+`,
+			want: "model_routes fallback cycle detected",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsFallbackChain(t *testing.T) {
+	cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases: {first: first-model, second: second-model, third: third-model}
+    priority: 10
+model_routes:
+  first:
+    providers: [primary]
+    fallback: second
+  second:
+    providers: [primary]
+    fallback: third
+  third:
+    providers: [primary]
+`)
+	if cfg.ModelRoutes["first"].Fallback != "second" || cfg.ModelRoutes["second"].Fallback != "third" {
+		t.Fatalf("fallback chain = %#v", cfg.ModelRoutes)
+	}
+}
+
 func TestLoadParsesFailoverOn404(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		cfg := loadConfig(t, fmt.Sprintf(`reasoning_effort: max

@@ -115,8 +115,11 @@ type Config struct {
 
 // ModelRoute maps a Virtual Model to an optional ordered list of Provider
 // names. An empty Providers list means use the global Provider priority order.
+// Fallback names another model route to try when every Provider on this route
+// fails (or is in cooldown).
 type ModelRoute struct {
 	Providers []string
+	Fallback  string
 }
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
@@ -164,6 +167,7 @@ type rawProvider struct {
 
 type rawModelRoute struct {
 	Providers []string `yaml:"providers"`
+	Fallback  string   `yaml:"fallback"`
 }
 
 // Load reads, defaults, normalizes, and validates one YAML configuration file.
@@ -254,7 +258,10 @@ func Load(path string) (Config, error) {
 		for _, providerName := range rawRoute.Providers {
 			providers = append(providers, strings.TrimSpace(providerName))
 		}
-		cfg.ModelRoutes[strings.TrimSpace(name)] = ModelRoute{Providers: providers}
+		cfg.ModelRoutes[strings.TrimSpace(name)] = ModelRoute{
+			Providers: providers,
+			Fallback:  strings.TrimSpace(rawRoute.Fallback),
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -444,6 +451,50 @@ func (c Config) validateModelRoutes() error {
 			if usable == 0 {
 				return fmt.Errorf("model_routes[%q] has no Providers with a model alias", routeName)
 			}
+		}
+		if fallback := strings.TrimSpace(route.Fallback); fallback != "" {
+			if _, exists := c.ModelRoutes[fallback]; !exists {
+				return fmt.Errorf("model_routes[%q].fallback references unknown model route %q", routeName, fallback)
+			}
+			if fallback == routeName {
+				return fmt.Errorf("model_routes[%q].fallback cannot reference itself", routeName)
+			}
+		}
+	}
+	if err := validateFallbackCycles(c.ModelRoutes); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateFallbackCycles(routes map[string]ModelRoute) error {
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+	states := make(map[string]int, len(routes))
+	var visit func(string) error
+	visit = func(routeName string) error {
+		switch states[routeName] {
+		case visiting:
+			return fmt.Errorf("model_routes fallback cycle detected at %q", routeName)
+		case visited:
+			return nil
+		}
+		states[routeName] = visiting
+		route := routes[routeName]
+		if fallback := strings.TrimSpace(route.Fallback); fallback != "" {
+			if err := visit(fallback); err != nil {
+				return err
+			}
+		}
+		states[routeName] = visited
+		return nil
+	}
+	for routeName := range routes {
+		if err := visit(routeName); err != nil {
+			return err
 		}
 	}
 	return nil

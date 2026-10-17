@@ -94,6 +94,21 @@ curl http://127.0.0.1:58081/v1/models
 
 It returns route IDs in configuration order with stable `model` metadata. Provider URLs, credentials, upstream aliases, and temporary Provider health are not exposed.
 
+#### Route fallbacks
+
+A route may point at another route to retry when all its providers fail (server error, cooldown, or blocked/paused key):
+
+```yaml
+model_routes:
+  gonka:
+    providers: [gonka24]
+  glm-5.3-flash:
+    providers: [easy-gonka]
+    fallback: gonka   # if easy-gonka fails, retry on the gonka route
+```
+
+Fallback chains are allowed (`fallback` → `fallback`), and cycles or unknown route references are rejected at startup with an actionable error.
+
 ## Reasoning effort
 
 `reasoning_effort` hints how much reasoning the upstream model should do. The proxy writes your configured value into every upstream request — whatever the client sends is overwritten. Allowed values: `none`, `low`, `medium`, `high`, `xhigh`, `max`, plus `null` (`~`) to strip the field entirely. The top-level key is **required**.
