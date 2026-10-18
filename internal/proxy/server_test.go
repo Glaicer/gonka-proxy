@@ -916,6 +916,76 @@ func TestChatCompletionsFailsOverOnServerErrors(t *testing.T) {
 	}
 }
 
+// A 401/403 whose body marks the upstream's own API key as paused or access
+// disabled can never succeed on that provider regardless of retries. The proxy
+// must treat it like a failover failure (hide it from the client, route around
+// the provider, put it in cooldown) instead of returning it unchanged. This is
+// the contract behind the report that a disabled broker key leaked as a raw 401.
+func TestChatCompletionsFailsOverOnPausedOrDisabledAPIKey(t *testing.T) {
+	disabledBodies := map[string]string{
+		"paused_or_disabled": `{"error":{"message":"API key is paused or access disabled. Check its status: https://app.gonkabroker.com/api-keys","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`,
+		// LiteLLM-style brokers block a key instead of pausing it and point
+		// admins at their /key/unblock endpoint.
+		"litellm_blocked": `{"error":{"message":"Authentication Error, Key is blocked. Update via ` + "`/key/unblock`" + ` if you're an admin.","type":"auth_error","param":"None","code":"401"}}`,
+	}
+	for bodyName, disabledBody := range disabledBodies {
+		for _, statusCode := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+			t.Run(fmt.Sprintf("%s_status_%d", bodyName, statusCode), func(t *testing.T) {
+				var primaryHits atomic.Int32
+				var backupHits atomic.Int32
+
+				primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					primaryHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(statusCode)
+					_, _ = io.WriteString(w, disabledBody)
+				}))
+				defer primaryProvider.Close()
+
+				backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					backupHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"provider":"backup"}`)
+				}))
+				defer backupProvider.Close()
+
+				server := newProxyServer(t, []providerFixture{
+					{baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+					{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+				})
+				defer server.Close()
+
+				for requestNumber := 0; requestNumber < 2; requestNumber++ {
+					resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+					if err != nil {
+						t.Fatalf("proxy request: %v", err)
+					}
+					responseBody, err := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					if err != nil {
+						t.Fatalf("read response body: %v", err)
+					}
+					// The client must never see the provider's disabled-key 401: it gets
+					// a successful answer from the backup provider instead.
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("request %d status = %d, want %d (disabled-key error leaked)", requestNumber+1, resp.StatusCode, http.StatusOK)
+					}
+					if string(responseBody) != `{"provider":"backup"}` {
+						t.Fatalf("request %d body = %s, want backup response", requestNumber+1, responseBody)
+					}
+				}
+
+				if got := primaryHits.Load(); got != 1 {
+					t.Fatalf("primary Provider received %d requests, want 1 (second request must skip it via cooldown)", got)
+				}
+				if got := backupHits.Load(); got != 2 {
+					t.Fatalf("backup Provider received %d requests, want 2", got)
+				}
+			})
+		}
+	}
+}
+
 func TestChatCompletionsFailsOverOnEmptyCompletion(t *testing.T) {
 	cases := []struct {
 		name        string
