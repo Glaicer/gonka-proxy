@@ -20,6 +20,7 @@ import (
 )
 
 const chatCompletionsPath = "/v1/chat/completions"
+const modelsPath = "/v1/models"
 const emptyCompletionCategory = "empty-completion"
 
 const (
@@ -43,6 +44,12 @@ type Logger interface {
 // Server implements the public OpenAI-compatible HTTP endpoint.
 type Server struct {
 	providers        []*provider
+	routes           map[string][]*provider
+	fallbacks        map[string]string
+	modelOrder       []string
+	legacyModelMode  bool
+	fallbackMode     bool
+	metrics          *metricsCollector
 	client           *http.Client
 	cooldownDuration time.Duration
 	recoveryWait     time.Duration
@@ -86,16 +93,19 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	normalizedEffort := normalizeReasoningEffort(cfg.ReasoningEffort)
 
 	providers := make([]*provider, 0, len(cfg.Providers))
+	providersByName := make(map[string]*provider, len(cfg.Providers))
 	for _, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
-		providers = append(providers, &provider{
+		selected := &provider{
 			Provider:        configuredProvider,
 			chatURL:         chatURL,
 			reasoningEffort: resolveReasoningEffort(normalizedEffort, configuredProvider),
-		})
+		}
+		providers = append(providers, selected)
+		providersByName[selected.Name] = selected
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
 		return providers[i].Priority > providers[j].Priority
@@ -108,8 +118,51 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
-	return &Server{
+	routes := make(map[string][]*provider)
+	fallbacks := make(map[string]string)
+	modelRoutes := cfg.ModelRoutes
+	if len(modelRoutes) == 0 {
+		modelRoutes = map[string]config.ModelRoute{"gonka": {}}
+	}
+	modelOrder := append([]string(nil), cfg.ModelRouteOrder...)
+	if len(modelOrder) == 0 {
+		for routeName := range modelRoutes {
+			modelOrder = append(modelOrder, routeName)
+		}
+		sort.Strings(modelOrder)
+	}
+	for routeName, modelRoute := range modelRoutes {
+		routeProviders := make([]*provider, 0, len(providers))
+		if len(modelRoute.Providers) == 0 {
+			for _, selected := range providers {
+				if _, ok := selected.ModelAliasFor(routeName); ok {
+					routeProviders = append(routeProviders, selected)
+				}
+			}
+		} else {
+			for _, providerName := range modelRoute.Providers {
+				selected := providersByName[providerName]
+				if selected == nil {
+					continue
+				}
+				if _, ok := selected.ModelAliasFor(routeName); ok {
+					routeProviders = append(routeProviders, selected)
+				}
+			}
+		}
+		routes[routeName] = routeProviders
+		if fallback := strings.TrimSpace(modelRoute.Fallback); fallback != "" {
+			fallbacks[routeName] = fallback
+		}
+	}
+
+	server := &Server{
 		providers:        providers,
+		routes:           routes,
+		fallbacks:        fallbacks,
+		modelOrder:       modelOrder,
+		legacyModelMode:  len(cfg.ModelRoutes) == 0,
+		fallbackMode:     len(cfg.ModelRoutes) > 0,
 		cooldownDuration: cfg.Cooldown,
 		recoveryWait:     cfg.RecoveryWait,
 		client: &http.Client{
@@ -118,7 +171,13 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		logger:        logger,
 		logLevel:      logLevel,
 		failoverOn404: cfg.FailoverOn404,
-	}, nil
+	}
+	providerNames := make([]string, 0, len(providers))
+	for _, selected := range providers {
+		providerNames = append(providerNames, server.redactProviderSecrets(selected.Name))
+	}
+	server.metrics = newMetricsCollector(cfg.HealthHistoryPath, providerNames, logger)
+	return server, nil
 }
 
 // normalizeReasoningEffort normalizes an effort pointer so programmatic
@@ -145,17 +204,60 @@ func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *
 
 // ServeHTTP handles the single MVP endpoint.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == modelsPath {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.serveModels(w); err != nil {
+			s.logAt(config.LogLevelError, "models response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := s.metrics.serveHTTP(w); err != nil {
+			s.logAt(config.LogLevelError, "metrics response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/health" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if err := s.metrics.serveHealth(w); err != nil {
+			s.logAt(config.LogLevelError, "health response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/diagnostics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.serveDiagnostics(w, r.Context()); err != nil {
+			s.logAt(config.LogLevelError, "diagnostics response error - %v", err)
+		}
+		return
+	}
 	if r.URL.Path != chatCompletionsPath {
-		http.NotFound(w, r)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeOpenAIError(w, "method not allowed", http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed")
-		return
-	}
-	if len(s.providers) == 0 {
-		writeOpenAIError(w, "No Providers configured", http.StatusServiceUnavailable, "server_error", "no_providers_configured")
 		return
 	}
 
@@ -206,142 +308,273 @@ func writeOpenAIError(w http.ResponseWriter, message string, statusCode int, err
 	})
 }
 
+type modelListResponse struct {
+	Object string       `json:"object"`
+	Data   []modelEntry `json:"data"`
+}
+
+type modelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+func (s *Server) serveModels(w http.ResponseWriter) error {
+	response := modelListResponse{
+		Object: "list",
+		Data:   make([]modelEntry, 0, len(s.modelOrder)),
+	}
+	for _, model := range s.modelOrder {
+		if _, exists := s.routes[model]; !exists {
+			continue
+		}
+		response.Data = append(response.Data, modelEntry{
+			ID:      model,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: "gonka-proxy",
+		})
+	}
+	return json.NewEncoder(w).Encode(response)
+}
+
+// routeFailure records why a route's providers all failed, so a fallback
+// route (or the caller, in fallback mode) can report a meaningful status.
+type routeFailure struct {
+	status   int
+	category string
+}
+
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+	requestStarted := time.Now()
+	model, err := requestModel(payload)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	routeName := model
+	if _, ok := s.routes[routeName]; !ok && s.legacyModelMode {
+		routeName = "gonka"
+	}
+	if _, ok := s.routes[routeName]; !ok {
+		http.Error(w, fmt.Sprintf("unknown model %q", model), http.StatusNotFound)
+		return
+	}
+
+	visited := make(map[string]struct{}, len(s.routes))
 	for {
 		if r.Context().Err() != nil {
 			s.logCancellation("routing")
 			return
 		}
+		if _, exists := visited[routeName]; exists {
+			http.Error(w, "fallback route visited more than once", http.StatusBadGateway)
+			return
+		}
+		visited[routeName] = struct{}{}
 
-		for _, selected := range s.providers {
+		routeProviders := s.routes[routeName]
+		if len(routeProviders) == 0 {
+			http.Error(w, "no Providers configured for model", http.StatusServiceUnavailable)
+			return
+		}
+		var lastFailure routeFailure
+
+		for {
 			if r.Context().Err() != nil {
 				s.logCancellation("routing")
 				return
 			}
 
-			if !s.providerAvailable(selected, time.Now()) {
-				continue
-			}
-			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
-
-			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
-			if err != nil {
-				writeOpenAIError(w, fmt.Sprintf("could not encode upstream request: %v", err), http.StatusBadGateway, "server_error", "upstream_encode_error")
-				return
-			}
-
-			upstreamRequest, err := http.NewRequestWithContext(
-				r.Context(),
-				http.MethodPost,
-				selected.chatURL,
-				bytes.NewReader(upstreamBody),
-			)
-			if err != nil {
-				writeOpenAIError(w, "could not create upstream request", http.StatusBadGateway, "server_error", "upstream_request_error")
-				return
-			}
-			copyHeaders(upstreamRequest.Header, r.Header)
-			upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
-
-			upstreamResponse, err := s.client.Do(upstreamRequest)
-			if err != nil {
+			for _, selected := range routeProviders {
 				if r.Context().Err() != nil {
-					s.logCancellation("upstream")
+					s.logCancellation("routing")
 					return
 				}
-				s.logProviderResponse(selected, 0, err.Error())
-				category := "network"
-				if isResponseHeaderTimeout(err) {
-					category = "response-header-timeout"
+
+				if !s.providerAvailable(selected, time.Now()) {
+					s.metrics.recordCooldownSkip(s.metricProviderName(selected))
+					continue
 				}
-				s.handleFailoverFailure(selected, category, 0)
-				continue
-			}
+				attemptStarted := time.Now()
+				s.metrics.recordRequestStart(s.metricProviderName(selected))
+				s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
 
-			if upstreamResponse.StatusCode != http.StatusOK {
-				if isFailoverStatus(upstreamResponse.StatusCode) || (s.failoverOn404 && upstreamResponse.StatusCode == http.StatusNotFound) {
-					var errorMessage string
-					if s.payloadLoggingEnabled() {
-						responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
-						if readErr == nil && len(responseBody) > 0 {
-							errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
-						}
-					} else {
-						_ = upstreamResponse.Body.Close()
-					}
-					_ = upstreamResponse.Body.Close()
-					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
+				modelAlias, ok := selected.ModelAliasFor(routeName)
+				if !ok {
+					continue
+				}
+				upstreamBody, err := applyUpstreamOverrides(payload, modelAlias, selected.reasoningEffort)
+				if err != nil {
+					writeOpenAIError(w, fmt.Sprintf("could not encode upstream request: %v", err), http.StatusBadGateway, "server_error", "upstream_encode_error")
+					return
+				}
 
-					category := "server-error"
-					switch upstreamResponse.StatusCode {
-					case http.StatusPaymentRequired:
-						category = "payment-required"
-					case http.StatusTooManyRequests:
-						category = "rate-limit"
-					case http.StatusNotFound:
-						category = "not-found"
+				upstreamRequest, err := http.NewRequestWithContext(
+					r.Context(),
+					http.MethodPost,
+					selected.chatURL,
+					bytes.NewReader(upstreamBody),
+				)
+				if err != nil {
+					writeOpenAIError(w, "could not create upstream request", http.StatusBadGateway, "server_error", "upstream_request_error")
+					return
+				}
+				copyHeaders(upstreamRequest.Header, r.Header)
+				upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
+
+				upstreamResponse, err := s.client.Do(upstreamRequest)
+				if err != nil {
+					if r.Context().Err() != nil {
+						s.logCancellation("upstream")
+						return
 					}
-					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
+					s.logProviderResponse(selected, 0, err.Error())
+					category := "network"
+					if isResponseHeaderTimeout(err) {
+						category = "response-header-timeout"
+					}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), 0, category)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					lastFailure = routeFailure{status: http.StatusBadGateway, category: category}
+					s.handleFailoverFailure(selected, category, 0)
 					continue
 				}
 
-				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
-				_ = upstreamResponse.Body.Close()
-				errorMessage := ""
-				if readErr != nil {
-					errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
-				} else if len(responseBody) > 0 {
-					errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
-				}
-				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
+				if upstreamResponse.StatusCode != http.StatusOK {
+					if isFailoverStatus(upstreamResponse.StatusCode) || (s.failoverOn404 && upstreamResponse.StatusCode == http.StatusNotFound) {
+						var errorMessage string
+						if s.payloadLoggingEnabled() {
+							responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
+							if readErr == nil && len(responseBody) > 0 {
+								errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
+							}
+						} else {
+							_ = upstreamResponse.Body.Close()
+						}
+						_ = upstreamResponse.Body.Close()
+						s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
-				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
-					s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
+						category := "server-error"
+						switch upstreamResponse.StatusCode {
+						case http.StatusPaymentRequired:
+							category = "payment-required"
+						case http.StatusTooManyRequests:
+							category = "rate-limit"
+						case http.StatusNotFound:
+							category = "not-found"
+						}
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, category)
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: category}
+						s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
+						continue
+					}
+
+					responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+					_ = upstreamResponse.Body.Close()
+					errorMessage := ""
+					if readErr != nil {
+						errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
+					} else if len(responseBody) > 0 {
+						errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
+					}
+					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
+
+					if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "reasoning-effort")
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "reasoning-effort"}
+						s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
+						continue
+					}
+
+					copyHeaders(w.Header(), upstreamResponse.Header)
+					w.WriteHeader(upstreamResponse.StatusCode)
+					_, _ = w.Write(responseBody)
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "client-error")
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					return
+				}
+
+				s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
+				s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "success")
+
+				streaming := isStreamingResponse(upstreamResponse, payload)
+				defer upstreamResponse.Body.Close()
+				if streaming {
+					copyHeaders(w.Header(), upstreamResponse.Header)
+					w.WriteHeader(upstreamResponse.StatusCode)
+					completed := s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					if completed {
+						s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+					}
+					return
+				}
+
+				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+				if readErr != nil {
+					if r.Context().Err() != nil {
+						s.logCancellation("upstream-body")
+						return
+					}
+					lastFailure = routeFailure{status: http.StatusBadGateway, category: "upstream-read"}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), http.StatusBadGateway, "upstream-read")
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
+					continue
+				}
+
+				if isEmptyCompletion(responseBody) {
+					lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: emptyCompletionCategory}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, emptyCompletionCategory)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
 					continue
 				}
 
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
+				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+				s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
 				return
 			}
 
-			s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
-
-			streaming := isStreamingResponse(upstreamResponse, payload)
-			defer upstreamResponse.Body.Close()
-			if streaming {
-				copyHeaders(w.Header(), upstreamResponse.Header)
-				w.WriteHeader(upstreamResponse.StatusCode)
-				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
-				return
-			}
-
-			responseBody, readErr := io.ReadAll(upstreamResponse.Body)
-			if readErr != nil {
-				if r.Context().Err() != nil {
-					s.logCancellation("upstream-body")
-					return
+			if fallback, ok := s.fallbacks[routeName]; ok {
+				reason := lastFailure.category
+				if reason == "" {
+					reason = "providers-cooling-down"
 				}
-				s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
-				continue
+				s.logAt(config.LogLevelInfo, "route fallback - %s -> %s - %s", routeName, fallback, reason)
+				routeName = fallback
+				break
 			}
-
-			if isEmptyCompletion(responseBody) {
-				s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
-				continue
+			if s.fallbackMode {
+				s.writeRouteFailure(w, lastFailure)
+				return
 			}
-
-			copyHeaders(w.Header(), upstreamResponse.Header)
-			w.WriteHeader(upstreamResponse.StatusCode)
-			_, _ = w.Write(responseBody)
-			return
-		}
-
-		if !s.waitForRecovery(r.Context()) {
-			return
+			if !s.waitForRecovery(r.Context()) {
+				return
+			}
 		}
 	}
+}
+
+func (s *Server) writeRouteFailure(w http.ResponseWriter, failure routeFailure) {
+	if failure.status == 0 {
+		http.Error(w, "all Providers are unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, fmt.Sprintf("all Providers failed: %s", failure.category), failure.status)
 }
 
 func (s *Server) waitForRecovery(ctx context.Context) bool {
@@ -398,6 +631,7 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	}
 	s.cooldownMu.Unlock()
 	for _, selected := range cleared {
+		s.metrics.recordCooldownCleared(s.metricProviderName(selected))
 		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", s.redactProviderSecrets(selected.Name))
 	}
 	return len(cleared)
@@ -468,7 +702,7 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) bool {
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -490,13 +724,13 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 				if !acc.sawDone() {
 					s.logCancellation("stream")
 				}
-				return
+				return false
 			}
 			acc.observe(chunk)
 			if writeErr != nil {
 				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
-				return
+				return false
 			}
 			if canFlush {
 				flusher.Flush()
@@ -510,25 +744,28 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			if !acc.sawDone() {
 				s.logCancellation("stream")
 			}
-			return
+			return false
 		}
 		if errors.Is(readErr, io.EOF) {
 			if acc.sawDone() {
-				return
+				return true
 			}
 			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(selected)
-			return
+			return false
 		}
+
 		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(selected, "stream", statusCode)
-		return
+		return false
 	}
 }
 
 func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+	s.metrics.recordStreamAbort(s.metricProviderName(selected), streamAbortCategory(reason))
+	s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 	providerName := s.redactProviderSecrets(selected.Name)
 	redactedReason := s.redactProviderSecrets(reason)
 	if s.payloadLoggingEnabled() {
@@ -538,6 +775,17 @@ func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes
 	}
 	s.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
 		providerName, statusCode, sentBytes, chunks, redactedReason)
+}
+
+func streamAbortCategory(reason string) string {
+	switch {
+	case strings.Contains(reason, "client-write"):
+		return "client-write"
+	case strings.Contains(reason, "without [DONE]"):
+		return "missing-done"
+	default:
+		return "upstream-read"
+	}
 }
 
 func tail(acc *dataChunk) string {
@@ -598,16 +846,22 @@ func (s *Server) markCooldown(selected *provider) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
+	s.metrics.recordCooldown(s.metricProviderName(selected), cooldownUntil)
 	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
+	s.metrics.recordFailover(s.metricProviderName(selected), category)
 	if statusCode > 0 {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", s.redactProviderSecrets(selected.Name), category, statusCode)
 	} else {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s", s.redactProviderSecrets(selected.Name), category)
 	}
 	s.markCooldown(selected)
+}
+
+func (s *Server) metricProviderName(selected *provider) string {
+	return s.redactProviderSecrets(selected.Name)
 }
 
 func (s *Server) logCancellation(phase string) {
@@ -888,6 +1142,18 @@ func decodeRequestBody(body []byte) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("decode request body")
 	}
 	return payload, nil
+}
+
+func requestModel(payload map[string]json.RawMessage) (string, error) {
+	rawModel, ok := payload["model"]
+	if !ok {
+		return "gonka", nil
+	}
+	var model string
+	if err := json.Unmarshal(rawModel, &model); err != nil || strings.TrimSpace(model) == "" {
+		return "", fmt.Errorf("model must be a non-empty string")
+	}
+	return strings.TrimSpace(model), nil
 }
 
 func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias string, reasoningEffort *config.ReasoningEffort) ([]byte, error) {
