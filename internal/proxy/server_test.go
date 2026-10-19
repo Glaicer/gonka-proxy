@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -475,6 +476,667 @@ func TestChatCompletionsUsesHighestPriorityProvider(t *testing.T) {
 	}
 	if got := lowHits.Load(); got != 0 {
 		t.Fatalf("lower-priority Provider received %d requests, want 0", got)
+	}
+}
+
+func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
+	var firstHits atomic.Int32
+	var secondHits atomic.Int32
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"first"}`)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits.Add(1)
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		if payload["model"] != "glm-second" {
+			t.Errorf("upstream model = %v, want glm-second", payload["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"second"}`)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "first", BaseURL: firstProvider.URL + "/v1", APIKey: "first-secret", ModelAliases: map[string]string{"glm-5.3-flash": "glm-first"}, Priority: 100},
+			{Name: "second", BaseURL: secondProvider.URL + "/v1", APIKey: "second-secret", ModelAliases: map[string]string{"glm-5.3-flash": "glm-second"}, Priority: 10},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"glm-5.3-flash": {Providers: []string{"second", "first"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"glm-5.3-flash","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"second"}` {
+		t.Fatalf("response = (%d, %s), want second Provider success", response.StatusCode, body)
+	}
+	if firstHits.Load() != 0 || secondHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (0, 1)", firstHits.Load(), secondHits.Load())
+	}
+
+	unknown, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"unknown","messages":[]}`))
+	if err != nil {
+		t.Fatalf("unknown model request: %v", err)
+	}
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestChatCompletionsUsesFallbackRoute(t *testing.T) {
+	var primaryHits atomic.Int32
+	var fallbackHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"fallback"}`)
+	}))
+	defer fallback.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: primary.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "primary-model"}, Priority: 100},
+			{Name: "fallback", BaseURL: fallback.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "fallback-model"}, Priority: 50},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"fallback"}` {
+		t.Fatalf("response = (%d, %s), want fallback success", response.StatusCode, body)
+	}
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (1, 1)", primaryHits.Load(), fallbackHits.Load())
+	}
+}
+
+func TestChatCompletionsReturnsFinalFailureAfterFallbackChain(t *testing.T) {
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: firstProvider.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "model-a"}, Priority: 2},
+			{Name: "fallback", BaseURL: secondProvider.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "model-b"}, Priority: 1},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("response status = %d, want 502 (final failure after fallback chain)", response.StatusCode)
+	}
+	_ = body
+}
+
+func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "secret", ModelAliases: map[string]string{
+				"gonka": "deepseek-v4-flash-0731", "glm-5.3-flash": "glm-5.3-flash",
+			}, Priority: 10},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {Providers: []string{"primary"}},
+			"glm-5.3-flash": {Providers: []string{"primary"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash", "gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200", response.StatusCode)
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if body.Object != "list" || len(body.Data) != 2 {
+		t.Fatalf("models response = %#v", body)
+	}
+	if body.Data[0].ID != "glm-5.3-flash" || body.Data[1].ID != "gonka" {
+		t.Fatalf("model order = %q, %q", body.Data[0].ID, body.Data[1].ID)
+	}
+	for _, model := range body.Data {
+		if model.Object != "model" || model.Created != 0 || model.OwnedBy != "gonka-proxy" {
+			t.Errorf("model metadata = %#v", model)
+		}
+	}
+}
+
+func TestInitialVirtualModelsRouteEndToEnd(t *testing.T) {
+	var upstreamModels []string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		upstreamModels = append(upstreamModels, payload.Model)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"ok"}`)
+	}))
+	defer provider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "gonka-router", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", Priority: 100,
+			ModelAliases: map[string]string{
+				"gonka":                  "deepseek-v4-flash-0731",
+				"deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
+				"glm-5.3-flash":          "glm-5.3-flash",
+				"minimax-m2.7":           "minimax-m2.7",
+			},
+		}},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":                  {Providers: []string{"gonka-router"}},
+			"deepseek-v4-flash-0731": {Providers: []string{"gonka-router"}},
+			"glm-5.3-flash":          {Providers: []string{"gonka-router"}},
+			"minimax-m2.7":           {Providers: []string{"gonka-router"}},
+		},
+		ModelRouteOrder: []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requests := []struct {
+		model string
+		alias string
+	}{
+		{model: "gonka", alias: "deepseek-v4-flash-0731"},
+		{model: "deepseek-v4-flash-0731", alias: "deepseek-v4-flash-0731"},
+		{model: "glm-5.3-flash", alias: "glm-5.3-flash"},
+		{model: "minimax-m2.7", alias: "minimax-m2.7"},
+		{model: "", alias: "deepseek-v4-flash-0731"},
+	}
+	for _, request := range requests {
+		body := `{"messages":[]}`
+		if request.model != "" {
+			body = fmt.Sprintf(`{"model":%q,"messages":[]}`, request.model)
+		}
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("request model %q: %v", request.model, err)
+		}
+		if response.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			t.Fatalf("request model %q status = %d, body = %s", request.model, response.StatusCode, responseBody)
+		}
+		_ = response.Body.Close()
+	}
+	if !reflect.DeepEqual(upstreamModels, []string{
+		"deepseek-v4-flash-0731",
+		"deepseek-v4-flash-0731",
+		"glm-5.3-flash",
+		"minimax-m2.7",
+		"deepseek-v4-flash-0731",
+	}) {
+		t.Fatalf("upstream models = %#v", upstreamModels)
+	}
+
+	modelsResponse, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer modelsResponse.Body.Close()
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(modelsResponse.Body).Decode(&models); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	ids := make([]string, 0, len(models.Data))
+	for _, model := range models.Data {
+		ids = append(ids, model.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"}) {
+		t.Fatalf("model IDs = %#v", ids)
+	}
+
+	unknown, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"unknown","messages":[]}`))
+	if err != nil {
+		t.Fatalf("unknown model request: %v", err)
+	}
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestModelsPublishesFloorAcrossRouteProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "wide", BaseURL: "https://wide.example/v1", APIKey: "wide-secret", Priority: 100,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds", "minimax-m2.7": "mm"},
+				ModelLimits:  map[string]config.ModelLimit{"deepseek-v4-flash-0731": {Context: 400000, Output: 16384}},
+			},
+			{
+				Name: "narrow", BaseURL: "https://narrow.example/v1", APIKey: "narrow-secret", Priority: 50,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-narrow", "minimax-m2.7": "mm-narrow"},
+				ModelLimits: map[string]config.ModelLimit{
+					"deepseek-v4-flash-0731": {Context: 200000, Output: 8192},
+					"minimax-m2.7":           {Context: 180000},
+				},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-silent", "minimax-m2.7": "mm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"deepseek-v4-flash-0731": {},
+			"minimax-m2.7":           {},
+		},
+		ModelRouteOrder: []string{"deepseek-v4-flash-0731", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		// the floor comes from narrow, the smallest declared value in the route
+		"deepseek-v4-flash-0731": {Context: 200000, Output: 8192, ContextSet: true, OutputSet: true},
+		// narrow declares context only, so output stays unknown rather than 0
+		"minimax-m2.7": {Context: 180000, ContextSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsOmitsLimitsWhenNoProviderDeclaresThem(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+			ModelAliases: map[string]string{"gonka": "ds"},
+		}},
+		ModelRoutes:     map[string]config.ModelRoute{"gonka": {}},
+		ModelRouteOrder: []string{"gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	if got, ok := limits["gonka"]; ok {
+		t.Fatalf("published limits = %+v, want no entry for an undeclared model", got)
+	}
+}
+
+func TestModelsLimitsIgnoreProvidersOutsideTheRoute(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "member", BaseURL: "https://member.example/v1", APIKey: "member-secret", Priority: 100,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-member"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 400000, Output: 16384}},
+			},
+			{
+				// serves the same Virtual Model but is not in this route, so its
+				// smaller limit must not lower the published floor
+				Name: "outsider", BaseURL: "https://outsider.example/v1", APIKey: "outsider-secret", Priority: 50,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-outsider"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 1000, Output: 1}},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"glm-5.3-flash": {Providers: []string{"member"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"glm-5.3-flash": {Context: 400000, Output: 16384, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsLimitsUseLegacyProviderModel(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "legacy", BaseURL: "https://legacy.example/v1", APIKey: "legacy-secret", Priority: 10,
+			ModelAlias:  "upstream-model",
+			ModelLimits: map[string]config.ModelLimit{"gonka": {Context: 120000, Output: 4096}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"gonka": {Context: 120000, Output: 4096, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+type publishedLimit struct {
+	Context    int
+	Output     int
+	ContextSet bool
+	OutputSet  bool
+}
+
+// fetchModelLimits reads /v1/models and reports the limit fields per model,
+// separating an absent field from a zero one.
+func fetchModelLimits(t *testing.T, baseURL string) map[string]publishedLimit {
+	t.Helper()
+	response, err := http.Get(baseURL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextLength  *int   `json:"context_length"`
+			ContextWindow  *int   `json:"context_window"`
+			MaxOutputToken *int   `json:"max_output_tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	limits := make(map[string]publishedLimit, len(body.Data))
+	for _, entry := range body.Data {
+		limit := publishedLimit{}
+		if entry.ContextLength != nil {
+			limit.Context, limit.ContextSet = *entry.ContextLength, true
+		}
+		if entry.ContextWindow != nil {
+			if limit.ContextSet && limit.Context != *entry.ContextWindow {
+				t.Errorf("%s context_length %d disagrees with context_window %d", entry.ID, limit.Context, *entry.ContextWindow)
+			}
+			limit.Context, limit.ContextSet = *entry.ContextWindow, true
+		}
+		if entry.MaxOutputToken != nil {
+			limit.Output, limit.OutputSet = *entry.MaxOutputToken, true
+		}
+		if limit.ContextSet || limit.OutputSet {
+			limits[entry.ID] = limit
+		}
+	}
+	return limits
+}
+
+func TestDiagnosticsReportsUndeclaredModelLimitProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		HealthHistoryPath:     filepath.Join(t.TempDir(), "health-history.json"),
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "declared", BaseURL: "https://declared.example/v1", APIKey: "declared-secret", Priority: 100,
+				ModelAliases: map[string]string{"gonka": "ds", "glm-5.3-flash": "glm"},
+				ModelLimits: map[string]config.ModelLimit{
+					"gonka":         {Context: 200000, Output: 8192},
+					"glm-5.3-flash": {Context: 400000, Output: 16384},
+				},
+			},
+			{
+				// declares a context window but stays silent about generation,
+				// which must be reported per dimension
+				Name: "context-only", BaseURL: "https://context.example/v1", APIKey: "context-secret", Priority: 50,
+				ModelAliases: map[string]string{"gonka": "ds-context"},
+				ModelLimits:  map[string]config.ModelLimit{"gonka": {Context: 380000}},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"gonka": "ds-silent", "glm-5.3-flash": "glm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {},
+			"glm-5.3-flash": {Providers: []string{"declared"}},
+		},
+		ModelRouteOrder: []string{"gonka", "glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		ModelLimits []struct {
+			Model           string   `json:"model"`
+			ContextLength   int      `json:"context_length"`
+			MaxOutputTokens int      `json:"max_output_tokens"`
+			ContextUnknown  []string `json:"context_unknown_providers"`
+			OutputUnknown   []string `json:"output_unknown_providers"`
+			Remediation     string   `json:"remediation"`
+		} `json:"model_limits"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(body.ModelLimits) != 2 {
+		t.Fatalf("model_limits = %d entries, want 2: %+v", len(body.ModelLimits), body.ModelLimits)
+	}
+	if body.ModelLimits[0].Model != "gonka" {
+		t.Fatalf("first model = %q, want gonka in route order", body.ModelLimits[0].Model)
+	}
+	if body.ModelLimits[0].ContextLength != 200000 || body.ModelLimits[0].MaxOutputTokens != 8192 {
+		t.Errorf("gonka limits = %d/%d, want 200000/8192", body.ModelLimits[0].ContextLength, body.ModelLimits[0].MaxOutputTokens)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].ContextUnknown, []string{"silent"}) {
+		t.Errorf("gonka context_unknown = %v, want [silent]", body.ModelLimits[0].ContextUnknown)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].OutputUnknown, []string{"context-only", "silent"}) {
+		t.Errorf("gonka output_unknown = %v, want [context-only silent]", body.ModelLimits[0].OutputUnknown)
+	}
+	if body.ModelLimits[0].Remediation == "" {
+		t.Error("gonka remediation is empty, want a hint about the silent providers")
+	}
+	if len(body.ModelLimits[1].ContextUnknown) != 0 || len(body.ModelLimits[1].OutputUnknown) != 0 {
+		t.Errorf("glm-5.3-flash unknown = %v/%v, want none because its route lists only the declared provider",
+			body.ModelLimits[1].ContextUnknown, body.ModelLimits[1].OutputUnknown)
+	}
+	if body.ModelLimits[1].Remediation != "" {
+		t.Errorf("glm-5.3-flash remediation = %q, want empty", body.ModelLimits[1].Remediation)
+	}
+}
+
+func TestModelsListsLegacyGonkaRouteWithoutProviderDetails(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "secret-provider", BaseURL: "https://private.example/v1", APIKey: "private-key", ModelAlias: "private-upstream-model", Priority: 10,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read models response: %v", err)
+	}
+	if !strings.Contains(string(body), `"id":"gonka"`) || strings.Contains(string(body), "private") {
+		t.Fatalf("models response exposes unexpected details: %s", body)
 	}
 }
 
@@ -2692,6 +3354,523 @@ func TestChatCompletionsFailoverUsesEachProvidersReasoningEffort(t *testing.T) {
 		assertRequestBody(t, obs.body, requestBody, "backup-model", stringPtr("high"))
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for backup upstream observation")
+	}
+}
+
+func TestMetricsExposeProviderSuccessAndLatency(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", metricsResponse.StatusCode, http.StatusOK)
+	}
+	metrics := string(metricsBody)
+	for _, expected := range []string{
+		`gonka_proxy_provider_requests_total{provider="primary",result="success"} 1`,
+		`gonka_proxy_provider_upstream_responses_total{category="success",provider="primary",status="200"} 1`,
+		`gonka_proxy_provider_request_duration_seconds_count{provider="primary"} 1`,
+	} {
+		if !strings.Contains(metrics, expected) {
+			t.Errorf("metrics = %q, want %q", metrics, expected)
+		}
+	}
+	for _, secret := range []string{"provider-secret", "virtual-model", "answer"} {
+		if strings.Contains(metrics, secret) {
+			t.Errorf("metrics contain request/provider data %q: %q", secret, metrics)
+		}
+	}
+}
+
+func TestMetricsExposeFailoverAndCooldown(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backup.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: primary.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, time.Minute, time.Second)
+	defer server.Close()
+
+	post := func() {
+		t.Helper()
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	post()
+	post()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	metrics := string(metricsBody)
+	for _, expected := range []string{
+		`gonka_proxy_provider_upstream_responses_total{category="rate-limit",provider="primary",status="429"} 1`,
+		`gonka_proxy_provider_failovers_total{provider="primary",category="rate-limit"} 1`,
+		`gonka_proxy_provider_cooldowns_total{provider="primary"} 1`,
+		`gonka_proxy_provider_cooldown_skips_total{provider="primary"} 1`,
+	} {
+		if !strings.Contains(metrics, expected) {
+			t.Errorf("metrics = %q, want %q", metrics, expected)
+		}
+	}
+}
+
+func TestMetricsExposeStreamAbort(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"delta\":\"partial\"}\n\n")
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "streaming", baseURL: provider.URL + "/v1", apiKey: "stream-secret", modelAlias: "stream-model", priority: 1},
+	})
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	if !strings.Contains(string(metricsBody), `gonka_proxy_provider_stream_aborts_total{provider="streaming",reason="missing-done"} 1`) {
+		t.Fatalf("metrics = %q, want missing-done stream abort", metricsBody)
+	}
+}
+
+func TestHealthSummaryPersistsAcrossProxyRestart(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	healthPath := filepath.Join(t.TempDir(), "health-history.json")
+	newHandler := func(t *testing.T) http.Handler {
+		t.Helper()
+		reasoningMax := config.ReasoningEffortMax
+		handler, err := proxy.NewWithLogger(config.Config{
+			ListenAddress:         "127.0.0.1:8080",
+			HealthHistoryPath:     healthPath,
+			Cooldown:              time.Second,
+			RecoveryWait:          time.Second,
+			ResponseHeaderTimeout: time.Second,
+			ReasoningEffort:       &reasoningMax,
+			Providers: []config.Provider{
+				{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
+			},
+		}, log.Default())
+		if err != nil {
+			t.Fatalf("create proxy: %v", err)
+		}
+		return handler
+	}
+
+	first := httptest.NewServer(newHandler(t))
+	response, err := http.Post(first.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	first.Close()
+
+	second := httptest.NewServer(newHandler(t))
+	defer second.Close()
+	healthResponse, err := http.Get(second.URL + "/health")
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	defer healthResponse.Body.Close()
+	healthBody, err := io.ReadAll(healthResponse.Body)
+	if err != nil {
+		t.Fatalf("read health summary: %v", err)
+	}
+	if healthResponse.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", healthResponse.StatusCode, http.StatusOK)
+	}
+	for _, expected := range []string{
+		`provider "primary": status=healthy`,
+		`successes=1`,
+		`last_success=`,
+	} {
+		if !strings.Contains(string(healthBody), expected) {
+			t.Errorf("health summary = %q, want %q", healthBody, expected)
+		}
+	}
+}
+
+func TestHealthSummaryShowsDegradationAndRecovery(t *testing.T) {
+	const cooldown = 30 * time.Millisecond
+	var primaryHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if primaryHits.Add(1) == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"primary"}`)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backup.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: primary.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, cooldown, time.Second)
+	defer server.Close()
+
+	post := func() {
+		t.Helper()
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	post()
+	post()
+	health := func() string {
+		t.Helper()
+		response, err := http.Get(server.URL + "/health")
+		if err != nil {
+			t.Fatalf("health request: %v", err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read health summary: %v", err)
+		}
+		return string(body)
+	}
+	degraded := health()
+	if !strings.Contains(degraded, `provider "primary": status=degraded`) || !strings.Contains(degraded, `category=server-error`) {
+		t.Fatalf("degraded health = %q", degraded)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for primaryHits.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("primary provider did not become available")
+		}
+		post()
+		time.Sleep(5 * time.Millisecond)
+	}
+	recovered := health()
+	if !strings.Contains(recovered, `provider "primary": status=healthy`) {
+		t.Fatalf("recovered health = %q", recovered)
+	}
+}
+
+func TestHealthHistoryRetentionAndStorageFailureDoNotBlockRouting(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	func() {
+		historyPath := filepath.Join(t.TempDir(), "health-history.json")
+		savedAt := time.Now().Add(-2 * time.Second)
+		events := make([]map[string]any, 1005)
+		for index := range events {
+			events[index] = map[string]any{
+				"at":       savedAt.Add(time.Duration(index-1004) * time.Millisecond),
+				"provider": "primary",
+				"type":     "success",
+			}
+		}
+		historyData, err := json.Marshal(map[string]any{
+			"version":   1,
+			"saved_at":  savedAt,
+			"providers": map[string]any{"primary": map[string]any{}},
+			"events":    events,
+		})
+		if err != nil {
+			t.Fatalf("encode seeded health history: %v", err)
+		}
+		if err := os.WriteFile(historyPath, historyData, 0o600); err != nil {
+			t.Fatalf("seed health history: %v", err)
+		}
+		reasoningMax := config.ReasoningEffortMax
+		handler, err := proxy.NewWithLogger(config.Config{
+			ListenAddress: "127.0.0.1:8080", HealthHistoryPath: historyPath,
+			Cooldown: time.Second, RecoveryWait: time.Second, ResponseHeaderTimeout: time.Second,
+			ReasoningEffort: &reasoningMax,
+			Providers:       []config.Provider{{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "secret", ModelAlias: "model", Priority: 1}},
+		}, log.Default())
+		if err != nil {
+			t.Fatalf("create proxy: %v", err)
+		}
+		server := httptest.NewServer(handler)
+		defer server.Close()
+		response, requestErr := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual","messages":[]}`))
+		if requestErr != nil {
+			t.Fatalf("retention request: %v", requestErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		data, err := os.ReadFile(historyPath)
+		if err != nil {
+			t.Fatalf("read health history: %v", err)
+		}
+		var history struct {
+			Events []json.RawMessage `json:"events"`
+		}
+		if err := json.Unmarshal(data, &history); err != nil {
+			t.Fatalf("decode health history: %v", err)
+		}
+		if len(history.Events) > 1000 {
+			t.Fatalf("history events = %d, want at most 1000", len(history.Events))
+		}
+	}()
+
+	storagePath := filepath.Join(t.TempDir(), "not-a-file")
+	if err := os.Mkdir(storagePath, 0o700); err != nil {
+		t.Fatalf("create storage directory: %v", err)
+	}
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", HealthHistoryPath: storagePath,
+		Cooldown: time.Second, RecoveryWait: time.Second, ResponseHeaderTimeout: time.Second,
+		ReasoningEffort: &reasoningMax,
+		Providers:       []config.Provider{{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "secret", ModelAlias: "model", Priority: 1}},
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy with broken storage: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual","messages":[]}`))
+	if err != nil {
+		t.Fatalf("routing with broken storage: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("routing status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	_ = response.Body.Close()
+}
+
+func TestDiagnosticsClassifyProviderFailuresWithoutSendingChatPayloads(t *testing.T) {
+	const secret = "diagnostic-secret"
+	type fixture struct {
+		name       string
+		statusCode int
+		body       string
+		delay      time.Duration
+	}
+	fixtures := []fixture{
+		{name: "invalid-auth", statusCode: http.StatusUnauthorized},
+		{name: "rate-limit", statusCode: http.StatusTooManyRequests},
+		{name: "concurrency", statusCode: http.StatusTooManyRequests, body: `{"error":"concurrency limit reached"}`},
+		{name: "no-balance", statusCode: http.StatusOK, body: `{"models":[]}`},
+		{name: "insufficient-balance", statusCode: http.StatusPaymentRequired},
+		{name: "timeout", statusCode: http.StatusOK, delay: 100 * time.Millisecond},
+	}
+	providers := make([]config.Provider, 0, len(fixtures))
+	servers := make([]*httptest.Server, 0, len(fixtures))
+	for _, fixture := range fixtures {
+		fixture := fixture
+		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+				t.Errorf("diagnostic request = %s %s, want GET /v1/models", r.Method, r.URL.Path)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
+				t.Errorf("diagnostic authorization = %q, want provider key", got)
+			}
+			if fixture.delay > 0 {
+				time.Sleep(fixture.delay)
+			}
+			if fixture.statusCode != http.StatusOK {
+				w.WriteHeader(fixture.statusCode)
+			}
+			_, _ = io.WriteString(w, fixture.body)
+		}))
+		servers = append(servers, provider)
+		providers = append(providers, config.Provider{
+			Name: fixture.name, BaseURL: provider.URL + "/v1", APIKey: secret, ModelAlias: "model", Priority: 1,
+		})
+	}
+	defer func() {
+		for _, provider := range servers {
+			provider.Close()
+		}
+	}()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", Cooldown: time.Second, RecoveryWait: time.Second,
+		ResponseHeaderTimeout: 20 * time.Millisecond, ReasoningEffort: &reasoningMax, Providers: providers,
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read diagnostics: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var report struct {
+		Providers []struct {
+			Provider    string `json:"provider"`
+			Status      string `json:"status"`
+			Category    string `json:"category"`
+			Remediation string `json:"remediation"`
+			Balance     struct {
+				Status   string `json:"status"`
+				Category string `json:"category"`
+			} `json:"balance"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatalf("decode diagnostics: %v; body=%s", err, body)
+	}
+	got := make(map[string]struct {
+		status, category, remediation, balanceStatus, balanceCategory string
+	})
+	for _, provider := range report.Providers {
+		got[provider.Provider] = struct {
+			status, category, remediation, balanceStatus, balanceCategory string
+		}{provider.Status, provider.Category, provider.Remediation, provider.Balance.Status, provider.Balance.Category}
+	}
+	wants := map[string]struct {
+		status, category, remediation, balanceStatus, balanceCategory string
+	}{
+		"invalid-auth":         {"unavailable", "invalid-auth", "rotate or replace the provider API key", "unavailable", "unsupported"},
+		"rate-limit":           {"degraded", "rate-limit", "wait, reduce concurrency, or use another provider", "unavailable", "unsupported"},
+		"concurrency":          {"degraded", "concurrency-exhausted", "wait, reduce concurrency, or use another provider", "unavailable", "unsupported"},
+		"no-balance":           {"healthy", "ok", "none", "unavailable", "unsupported"},
+		"insufficient-balance": {"unavailable", "insufficient-balance", "top up the provider balance", "unavailable", "unsupported"},
+		"timeout":              {"degraded", "transient-timeout", "check the endpoint and retry", "unavailable", "unsupported"},
+	}
+	for name, want := range wants {
+		actual, ok := got[name]
+		if !ok {
+			t.Errorf("diagnostics missing provider %q: %s", name, body)
+			continue
+		}
+		if actual.status != want.status || actual.category != want.category || actual.remediation != want.remediation || actual.balanceStatus != want.balanceStatus || actual.balanceCategory != want.balanceCategory {
+			t.Errorf("diagnostics[%q] = %#v, want %#v", name, actual, want)
+		}
+	}
+	if strings.Contains(string(body), secret) || strings.Contains(string(body), "models") {
+		t.Fatalf("diagnostics leaked credentials or upstream body: %s", body)
+	}
+}
+
+func TestDiagnosticsUsesConfiguredBalanceCapability(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/balance" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"balance":12.5}`)
+			return
+		}
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[]}`)
+	}))
+	defer provider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", Cooldown: time.Second, RecoveryWait: time.Second,
+		ResponseHeaderTimeout: time.Second, ReasoningEffort: &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "balance-provider", BaseURL: provider.URL + "/v1", BalanceURL: provider.URL + "/balance",
+			APIKey: "secret", ModelAlias: "model", Priority: 1,
+		}},
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	var report struct {
+		Providers []struct {
+			Balance struct {
+				Status   string `json:"status"`
+				Category string `json:"category"`
+			} `json:"balance"`
+		} `json:"providers"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(report.Providers) != 1 || report.Providers[0].Balance.Status != "available" || report.Providers[0].Balance.Category != "ok" {
+		t.Fatalf("balance diagnostic = %#v, want available/ok", report.Providers)
 	}
 }
 

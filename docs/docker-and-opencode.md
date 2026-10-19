@@ -50,6 +50,20 @@ The `baseURL` intentionally ends in `/v1`. Do not configure individual upstream 
 
 Logs are written to the container console with timestamps. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation. `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded parsed Provider error message or stream tail that can contain Provider response content; this content is suppressed at `WARN` and `ERROR`. Prompts, request bodies, downstream authorization headers, and Provider API keys are never logged.
 
+## Metrics
+
+The same server exposes Prometheus-compatible metrics at `GET /metrics`. With the compose example, query them locally:
+
+```sh
+curl http://127.0.0.1:58081/metrics
+```
+
+The metrics report per-Provider successes and errors, upstream status/category, failovers, cooldowns, stream aborts, and latency histograms. They do not include request or response bodies, authorization headers, or API keys. Keep the host binding loopback-only if metrics should not be reachable from the network.
+
+For a human-readable provider summary, query `GET /health`. It reports current status, last success/error, cooldown transitions, counts, and latency averages. Health history is persisted at `health_history_path` with a 30-day/1,000-event retention limit. Persistence is best-effort: a broken path is logged but does not interrupt proxy routing.
+
+For active diagnostics, query `GET /diagnostics`. The proxy sends only authenticated `GET` checks to each provider (default `<base_url>/models`), never chat prompts or tools. Configure an optional provider `balance_url` for upstreams that expose a balance API; omitted capability is reported as `unavailable/unsupported`. Every report also includes an `observed` block summarizing the last 24 hours of recorded traffic (successes, failures, error categories, cooldown, latency) straight from local history, so it costs no extra upstream request.
+
 ## Container smoke test
 
 The smoke test builds the production image and a fake HTTPS OpenAI-compatible Provider, publishes the proxy on the host loopback interface, then sends a real request through that published endpoint:
