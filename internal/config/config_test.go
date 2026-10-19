@@ -45,6 +45,86 @@ providers:
 	}
 }
 
+func TestLoadParsesModelAliasesAndRoutes(t *testing.T) {
+	cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases:
+      gonka: deepseek-v4-flash-0731
+      glm-5.3-flash: glm-upstream
+    priority: 10
+model_routes:
+  gonka:
+    providers: [primary]
+  glm-5.3-flash:
+    providers: [primary]
+`)
+
+	provider := cfg.Providers[0]
+	if alias, ok := provider.ModelAliasFor("glm-5.3-flash"); !ok || alias != "glm-upstream" {
+		t.Fatalf("GLM alias = %q, %t; want glm-upstream, true", alias, ok)
+	}
+	if len(cfg.ModelRoutes) != 2 || cfg.ModelRoutes["glm-5.3-flash"].Providers[0] != "primary" {
+		t.Fatalf("model routes = %#v", cfg.ModelRoutes)
+	}
+	if len(cfg.ModelRouteOrder) != 2 || cfg.ModelRouteOrder[0] != "gonka" || cfg.ModelRouteOrder[1] != "glm-5.3-flash" {
+		t.Fatalf("model route order = %#v", cfg.ModelRouteOrder)
+	}
+}
+
+func TestLoadRejectsInvalidModelRoutes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "unknown provider",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases: {gonka: upstream}
+    priority: 10
+model_routes:
+  gonka:
+    providers: [missing]
+`,
+			want: `model_routes["gonka"] references unknown Provider "missing"`,
+		},
+		{
+			name: "no usable alias",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_aliases: {gonka: upstream}
+    priority: 10
+model_routes:
+  glm-5.3-flash:
+    providers: [primary]
+`,
+			want: `model_routes["glm-5.3-flash"] has no Providers with a model alias`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadParsesFailoverOn404(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		cfg := loadConfig(t, fmt.Sprintf(`reasoning_effort: max

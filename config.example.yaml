@@ -31,11 +31,9 @@ log_level: WARN
 # Default when you want reasoning: max. Most of providers already support it. See README for details.
 reasoning_effort: max
 
-# List of upstream LLM providers the proxy can route to. These are placeholders,
-# not real credentials. Each entry: name (unique id), base_url (API endpoint),
-# api_key (auth), model_alias (model name to match requests against), priority
-# (higher = preferred; equal priorities keep YAML order). Copy a block to add
-# another provider.
+# List of upstream Gonka Providers the proxy can route to. These are
+# placeholders, not real credentials. The legacy model_alias form below is
+# still supported and automatically serves the gonka Virtual Model.
 #
 # Optional per-provider reasoning_effort overrides the global value for that
 # provider with any allowed value; null (~) strips the field entirely (for
@@ -52,3 +50,22 @@ providers:
     model_alias: backup-model-name
     priority: 50
     reasoning_effort: ~
+
+# Optional multi-model routing. When present, model_routes is authoritative.
+# Each Provider may map a Virtual Model to its upstream Model Alias. A route's
+# provider list is ordered explicitly; omit it to use global priority order.
+# Providers without an alias for a route are skipped.
+#
+# providers:
+#   - name: primary
+#     base_url: https://provider.example/v1
+#     api_key: replace-with-provider-key
+#     model_aliases:
+#       gonka: deepseek-v4-flash-0731
+#       deepseek-v4-flash-0731: deepseek-v4-flash-0731
+#     priority: 100
+# model_routes:
+#   gonka:
+#     providers: [primary]
+#   deepseek-v4-flash-0731:
+#     providers: [primary]

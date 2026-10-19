@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,31 +109,41 @@ type Config struct {
 	ReasoningEffort       *ReasoningEffort
 	FailoverOn404         bool
 	Providers             []Provider
+	ModelRoutes           map[string]ModelRoute
+	ModelRouteOrder       []string
+}
+
+// ModelRoute maps a Virtual Model to an optional ordered list of Provider
+// names. An empty Providers list means use the global Provider priority order.
+type ModelRoute struct {
+	Providers []string
 }
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
 // A provider-level reasoning_effort overrides the global value; an explicit
 // null strips the field for this provider. Leave both zero to inherit global.
 type Provider struct {
-	Name       string
-	BaseURL    string
-	APIKey     string
-	ModelAlias string
-	Priority   int
+	Name         string
+	BaseURL      string
+	APIKey       string
+	ModelAlias   string
+	ModelAliases map[string]string
+	Priority     int
 
 	ReasoningEffort      *ReasoningEffort
 	StripReasoningEffort bool
 }
 
 type rawConfig struct {
-	Server                rawServer     `yaml:"server"`
-	Cooldown              string        `yaml:"cooldown"`
-	RecoveryWait          string        `yaml:"recovery_wait"`
-	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
-	LogLevel              string        `yaml:"log_level"`
-	ReasoningEffort       *string       `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
-	FailoverOn404         bool          `yaml:"failover_on_404"`
-	Providers             []rawProvider `yaml:"providers"`
+	Server                rawServer                `yaml:"server"`
+	Cooldown              string                   `yaml:"cooldown"`
+	RecoveryWait          string                   `yaml:"recovery_wait"`
+	ResponseHeaderTimeout string                   `yaml:"response_header_timeout"`
+	LogLevel              string                   `yaml:"log_level"`
+	ReasoningEffort       *string                  `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
+	FailoverOn404         bool                     `yaml:"failover_on_404"`
+	Providers             []rawProvider            `yaml:"providers"`
+	ModelRoutes           map[string]rawModelRoute `yaml:"model_routes"`
 }
 
 type rawServer struct {
@@ -140,14 +151,19 @@ type rawServer struct {
 }
 
 type rawProvider struct {
-	Name       string `yaml:"name"`
-	BaseURL    string `yaml:"base_url"`
-	APIKey     string `yaml:"api_key"`
-	ModelAlias string `yaml:"model_alias"`
-	Priority   *int   `yaml:"priority"`
+	Name         string            `yaml:"name"`
+	BaseURL      string            `yaml:"base_url"`
+	APIKey       string            `yaml:"api_key"`
+	ModelAlias   string            `yaml:"model_alias"`
+	ModelAliases map[string]string `yaml:"model_aliases"`
+	Priority     *int              `yaml:"priority"`
 	// ReasoningEffort keeps the raw node to distinguish absent (inherit
 	// global, zero Node) from explicit null (strip for this provider).
 	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
+}
+
+type rawModelRoute struct {
+	Providers []string `yaml:"providers"`
 }
 
 // Load reads, defaults, normalizes, and validates one YAML configuration file.
@@ -163,6 +179,7 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &rawMap); err != nil {
 		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
 	}
+	modelRouteOrder := parseModelRouteOrder(data)
 	node, ok := rawMap["reasoning_effort"]
 	if !ok {
 		return Config{}, fmt.Errorf("reasoning_effort is required")
@@ -205,6 +222,8 @@ func Load(path string) (Config, error) {
 		ReasoningEffort:       parsedReasoningEffort,
 		FailoverOn404:         raw.FailoverOn404,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
+		ModelRoutes:           make(map[string]ModelRoute, len(raw.ModelRoutes)),
+		ModelRouteOrder:       modelRouteOrder,
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = DefaultListenAddress
@@ -230,10 +249,46 @@ func Load(path string) (Config, error) {
 		}
 		cfg.Providers = append(cfg.Providers, provider)
 	}
+	for name, rawRoute := range raw.ModelRoutes {
+		providers := make([]string, 0, len(rawRoute.Providers))
+		for _, providerName := range rawRoute.Providers {
+			providers = append(providers, strings.TrimSpace(providerName))
+		}
+		cfg.ModelRoutes[strings.TrimSpace(name)] = ModelRoute{Providers: providers}
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func parseModelRouteOrder(data []byte) []string {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil || len(document.Content) == 0 {
+		return nil
+	}
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value != "model_routes" {
+			continue
+		}
+		routes := root.Content[index+1]
+		if routes.Kind != yaml.MappingNode {
+			return nil
+		}
+		order := make([]string, 0, len(routes.Content)/2)
+		for routeIndex := 0; routeIndex+1 < len(routes.Content); routeIndex += 2 {
+			name := strings.TrimSpace(routes.Content[routeIndex].Value)
+			if name != "" {
+				order = append(order, name)
+			}
+		}
+		return order
+	}
+	return nil
 }
 
 // Validate ensures a Config can be used to start the proxy.
@@ -252,6 +307,9 @@ func (c Config) Validate() error {
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("providers must contain at least one Provider")
+	}
+	if err := c.validateModelRoutes(); err != nil {
+		return err
 	}
 	if c.ReasoningEffort != nil && !c.ReasoningEffort.IsValid() {
 		return fmt.Errorf(reasoningEffortErrorMsg)
@@ -274,8 +332,13 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(provider.APIKey) == "" {
 			return fmt.Errorf("providers[%d].api_key must not be empty", index)
 		}
-		if strings.TrimSpace(provider.ModelAlias) == "" {
+		if strings.TrimSpace(provider.ModelAlias) == "" && len(provider.ModelAliases) == 0 {
 			return fmt.Errorf("providers[%d].model_alias must not be empty", index)
+		}
+		for model, alias := range provider.ModelAliases {
+			if strings.TrimSpace(model) == "" || strings.TrimSpace(alias) == "" {
+				return fmt.Errorf("providers[%d].model_aliases must not contain empty model names or aliases", index)
+			}
 		}
 		if provider.ReasoningEffort != nil && !provider.ReasoningEffort.IsValid() {
 			return providerReasoningEffortError(index)
@@ -287,10 +350,11 @@ func (c Config) Validate() error {
 			return err
 		}
 		definitionKey := providerIdentity{
-			baseURL:    provider.BaseURL,
-			apiKey:     provider.APIKey,
-			modelAlias: provider.ModelAlias,
-			priority:   provider.Priority,
+			baseURL:      provider.BaseURL,
+			apiKey:       provider.APIKey,
+			modelAlias:   provider.ModelAlias,
+			modelAliases: modelAliasesIdentity(provider.ModelAliases),
+			priority:     provider.Priority,
 		}
 		if _, exists := seen[definitionKey]; exists {
 			return fmt.Errorf("providers[%d] duplicates another Provider definition", index)
@@ -301,10 +365,120 @@ func (c Config) Validate() error {
 }
 
 type providerIdentity struct {
-	baseURL    string
-	apiKey     string
-	modelAlias string
-	priority   int
+	baseURL      string
+	apiKey       string
+	modelAlias   string
+	modelAliases string
+	priority     int
+}
+
+func (c Config) validateModelRoutes() error {
+	if len(c.ModelRoutes) == 0 {
+		if len(c.ModelRouteOrder) > 0 {
+			return fmt.Errorf("model_route_order must be empty when model_routes is empty")
+		}
+		for _, provider := range c.Providers {
+			if strings.TrimSpace(provider.ModelAlias) != "" {
+				return nil
+			}
+		}
+		return fmt.Errorf("model_routes must contain at least one route when providers use model_aliases")
+	}
+
+	providersByName := make(map[string]Provider, len(c.Providers))
+	for _, provider := range c.Providers {
+		providersByName[strings.TrimSpace(provider.Name)] = provider
+	}
+
+	if len(c.ModelRouteOrder) != len(c.ModelRoutes) {
+		return fmt.Errorf("model_route_order must list every model route exactly once")
+	}
+	orderedRoutes := make(map[string]struct{}, len(c.ModelRouteOrder))
+	for index, rawRouteName := range c.ModelRouteOrder {
+		routeName := strings.TrimSpace(rawRouteName)
+		if routeName == "" {
+			return fmt.Errorf("model_route_order[%d] must not be empty", index)
+		}
+		if _, exists := c.ModelRoutes[routeName]; !exists {
+			return fmt.Errorf("model_route_order[%d] references unknown model route %q", index, routeName)
+		}
+		if _, exists := orderedRoutes[routeName]; exists {
+			return fmt.Errorf("model_route_order contains duplicate model route %q", routeName)
+		}
+		orderedRoutes[routeName] = struct{}{}
+	}
+
+	for rawRouteName, route := range c.ModelRoutes {
+		routeName := strings.TrimSpace(rawRouteName)
+		if routeName == "" {
+			return fmt.Errorf("model_routes contains an empty route name")
+		}
+		seen := make(map[string]struct{}, len(route.Providers))
+		usable := 0
+		for index, providerName := range route.Providers {
+			providerName = strings.TrimSpace(providerName)
+			if providerName == "" {
+				return fmt.Errorf("model_routes[%q].providers[%d] must not be empty", routeName, index)
+			}
+			if _, exists := seen[providerName]; exists {
+				return fmt.Errorf("model_routes[%q].providers contains duplicate Provider %q", routeName, providerName)
+			}
+			seen[providerName] = struct{}{}
+			provider, exists := providersByName[providerName]
+			if !exists {
+				return fmt.Errorf("model_routes[%q] references unknown Provider %q", routeName, providerName)
+			}
+			if _, ok := provider.ModelAliasFor(routeName); ok {
+				usable++
+			}
+		}
+		if len(route.Providers) > 0 && usable == 0 {
+			return fmt.Errorf("model_routes[%q] has no Providers with a model alias", routeName)
+		}
+		if len(route.Providers) == 0 {
+			for _, provider := range c.Providers {
+				if _, ok := provider.ModelAliasFor(routeName); ok {
+					usable++
+				}
+			}
+			if usable == 0 {
+				return fmt.Errorf("model_routes[%q] has no Providers with a model alias", routeName)
+			}
+		}
+	}
+	return nil
+}
+
+// ModelAliasFor resolves the upstream alias for a Virtual Model. A configured
+// model_aliases map takes precedence over the legacy scalar model_alias.
+func (p Provider) ModelAliasFor(model string) (string, bool) {
+	if len(p.ModelAliases) > 0 {
+		alias, ok := p.ModelAliases[model]
+		return strings.TrimSpace(alias), ok && strings.TrimSpace(alias) != ""
+	}
+	if model == "gonka" && strings.TrimSpace(p.ModelAlias) != "" {
+		return strings.TrimSpace(p.ModelAlias), true
+	}
+	return "", false
+}
+
+func modelAliasesIdentity(aliases map[string]string) string {
+	if len(aliases) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(aliases))
+	for key := range aliases {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var builder strings.Builder
+	for _, key := range keys {
+		builder.WriteString(key)
+		builder.WriteByte('=')
+		builder.WriteString(aliases[key])
+		builder.WriteByte(';')
+	}
+	return builder.String()
 }
 
 func parseDuration(field, value string, defaultValue time.Duration) (time.Duration, error) {
@@ -368,16 +542,28 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	}
 
 	provider := Provider{
-		Name:       strings.TrimSpace(raw.Name),
-		BaseURL:    normalizedURL,
-		APIKey:     strings.TrimSpace(raw.APIKey),
-		ModelAlias: strings.TrimSpace(raw.ModelAlias),
-		Priority:   *raw.Priority,
+		Name:         strings.TrimSpace(raw.Name),
+		BaseURL:      normalizedURL,
+		APIKey:       strings.TrimSpace(raw.APIKey),
+		ModelAlias:   strings.TrimSpace(raw.ModelAlias),
+		ModelAliases: normalizeModelAliases(raw.ModelAliases),
+		Priority:     *raw.Priority,
 
 		ReasoningEffort:      effortOverride,
 		StripReasoningEffort: stripEffort,
 	}
 	return provider, nil
+}
+
+func normalizeModelAliases(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(raw))
+	for model, alias := range raw {
+		normalized[strings.TrimSpace(model)] = strings.TrimSpace(alias)
+	}
+	return normalized
 }
 
 func parseProviderBaseURL(index int, value string) (*url.URL, error) {
