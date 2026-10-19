@@ -478,6 +478,270 @@ func TestChatCompletionsUsesHighestPriorityProvider(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
+	var firstHits atomic.Int32
+	var secondHits atomic.Int32
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"first"}`)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits.Add(1)
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		if payload["model"] != "glm-second" {
+			t.Errorf("upstream model = %v, want glm-second", payload["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"second"}`)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "first", BaseURL: firstProvider.URL + "/v1", APIKey: "first-secret", ModelAliases: map[string]string{"glm-5.3-flash": "glm-first"}, Priority: 100},
+			{Name: "second", BaseURL: secondProvider.URL + "/v1", APIKey: "second-secret", ModelAliases: map[string]string{"glm-5.3-flash": "glm-second"}, Priority: 10},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"glm-5.3-flash": {Providers: []string{"second", "first"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"glm-5.3-flash","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"second"}` {
+		t.Fatalf("response = (%d, %s), want second Provider success", response.StatusCode, body)
+	}
+	if firstHits.Load() != 0 || secondHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (0, 1)", firstHits.Load(), secondHits.Load())
+	}
+
+	unknown, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"unknown","messages":[]}`))
+	if err != nil {
+		t.Fatalf("unknown model request: %v", err)
+	}
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestChatCompletionsUsesFallbackRoute(t *testing.T) {
+	var primaryHits atomic.Int32
+	var fallbackHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"fallback"}`)
+	}))
+	defer fallback.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: primary.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "primary-model"}, Priority: 100},
+			{Name: "fallback", BaseURL: fallback.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "fallback-model"}, Priority: 50},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"fallback"}` {
+		t.Fatalf("response = (%d, %s), want fallback success", response.StatusCode, body)
+	}
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (1, 1)", primaryHits.Load(), fallbackHits.Load())
+	}
+}
+
+func TestChatCompletionsReturnsFinalFailureAfterFallbackChain(t *testing.T) {
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: firstProvider.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "model-a"}, Priority: 2},
+			{Name: "fallback", BaseURL: secondProvider.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "model-b"}, Priority: 1},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("response status = %d, want 502 (final failure after fallback chain)", response.StatusCode)
+	}
+	_ = body
+}
+
+func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "secret", ModelAliases: map[string]string{
+				"gonka": "deepseek-v4-flash-0731", "glm-5.3-flash": "glm-5.3-flash",
+			}, Priority: 10},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {Providers: []string{"primary"}},
+			"glm-5.3-flash": {Providers: []string{"primary"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash", "gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200", response.StatusCode)
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if body.Object != "list" || len(body.Data) != 2 {
+		t.Fatalf("models response = %#v", body)
+	}
+	if body.Data[0].ID != "glm-5.3-flash" || body.Data[1].ID != "gonka" {
+		t.Fatalf("model order = %q, %q", body.Data[0].ID, body.Data[1].ID)
+	}
+	for _, model := range body.Data {
+		if model.Object != "model" || model.Created != 0 || model.OwnedBy != "gonka-proxy" {
+			t.Errorf("model metadata = %#v", model)
+		}
+	}
+}
+
+func TestModelsListsLegacyGonkaRouteWithoutProviderDetails(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "secret-provider", BaseURL: "https://private.example/v1", APIKey: "private-key", ModelAlias: "private-upstream-model", Priority: 10,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read models response: %v", err)
+	}
+	if !strings.Contains(string(body), `"id":"gonka"`) || strings.Contains(string(body), "private") {
+		t.Fatalf("models response exposes unexpected details: %s", body)
+	}
+}
+
 func TestChatCompletionsPreservesDeclarationOrderForEqualPriority(t *testing.T) {
 	var firstHits atomic.Int32
 	var secondHits atomic.Int32
